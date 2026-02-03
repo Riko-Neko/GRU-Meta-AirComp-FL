@@ -40,6 +40,7 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     g = H_BR.dot(f_beam)  # shape (N,)
     # Cascaded channel per RIS element: product of BS-RIS and RIS-user channels
     cascaded = g * h_RU  # shape (N,), complex
+
     if reflect_on == 0:
         cascaded = np.zeros_like(cascaded)
     # Simulate P pilot transmissions with different RIS phase configurations
@@ -48,13 +49,16 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     # Using broadcasting: (theta_pattern * cascaded) sums over N for each row
     # Compute dot product of each pilot row with cascaded channel
     Y = np.zeros((P,), dtype=np.result_type(theta_pattern, cascaded))
+
     if reflect_on == 1:
         Y = Y + theta_pattern.dot(cascaded)  # shape (P,), complex
+
     if direct_on == 1:
         direct_eff = 0.0
         if h_BU is not None:
             direct_eff = h_BU.dot(f_beam)
         Y = Y + direct_eff
+
     if noise_std > 0:
         noise = (np.random.randn(P) + 1j * np.random.randn(P)) * (noise_std / np.sqrt(2))
         Y = Y + noise
