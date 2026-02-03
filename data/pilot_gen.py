@@ -11,7 +11,7 @@ def generate_pilot_pattern(P, N):
     return pattern
 
 
-def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0, *, h_BU=None, link_switch=(1, 1)):
+def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0, *, h_BU=None, link_switch=(1, 0)):
     """
     Simulate the pilot transmission for one user at current channels.
     - H_BR: numpy array of shape (N, M) for BS-RIS channel.
@@ -26,14 +26,14 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     - cascaded_channel: numpy array of shape (N,) complex cascaded channel (element-wise BS-RIS-user product).
     """
     if link_switch is None:
-        link_switch = (1, 1)
+        link_switch = (1, 0)
     if len(link_switch) != 2:
         raise ValueError("link_switch must be length-2: [reflect, direct]")
     reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
     if (reflect_on not in (0, 1)) or (direct_on not in (0, 1)):
         raise ValueError("link_switch elements must be 0 or 1")
     if reflect_on == 0 and direct_on == 0:
-        raise ValueError("link_switch [0,0] is invalid")
+        raise ValueError(f"Link is invalid: {link_switch}")
 
     # Effective BS->RIS channel with beamforming
     # If BS has multiple antennas, combine with f_beam
@@ -59,5 +59,3 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
         noise = (np.random.randn(P) + 1j * np.random.randn(P)) * (noise_std / np.sqrt(2))
         Y = Y + noise
     return Y, cascaded
-
-
