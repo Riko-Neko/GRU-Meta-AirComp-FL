@@ -8,6 +8,7 @@ This project simulates a RIS-assisted AirComp-FL system for fast personalized ca
 - Meta-FL with Reptile (or FedAvg fallback) across users.
 - AirComp aggregation distortion modeling with configurable SNR.
 - Joint beamforming and RIS phase optimization per round.
+- Optional direct (BS-UE) link and a switch to enable reflection/direct/both.
 - Time-varying RU channels via AR(1), with optional user heterogeneity and dynamic alpha(t).
 - Optional time-window GRU inputs and per-user local sample cache.
 
@@ -37,7 +38,7 @@ This project simulates a RIS-assisted AirComp-FL system for fast personalized ca
 
 ## How It Works (High Level)
 
-1. Generate pilot observations using current `H_BR`, `h_RU`, beam `f`, and RIS phases `theta`.
+1. Generate pilot observations using current `H_BR`, `h_RU`, optional `h_BU`, beam `f`, and RIS phases `theta`.
 2. Build per-user GRU sequences (optionally using a time window and local cache).
 3. Run local training on each user using CNN+GRU regression to estimate cascaded channels.
 4. Aggregate local models at the server with Reptile (or FedAvg), optionally through AirComp noise.
@@ -71,7 +72,7 @@ Set `use_synthetic_data = False` and provide `deepmimo_path` in `utils/config.py
 
 Supported file formats:
 
-- `.npz` archive containing `H_BR` and one of `h_RU`, `h_RUs`, or `H_RU`.
+- `.npz` archive containing `H_BR` and one of `h_RU`, `h_RUs`, or `H_RU`. Optional direct link keys: `h_BU`, `h_BUs`, or `H_BU`.
 - `.npy` containing a dict with the same keys.
 - `.npy` containing a 2D array `(K, N)` interpreted as `h_RU` with a fallback `H_BR` of ones.
 
@@ -79,6 +80,7 @@ Expected shapes:
 
 - `H_BR`: `(N, M)` complex
 - `h_RU`: `(K, N)` complex, or `(K, T, N)` for multiple snapshots (first snapshot used)
+- `h_BU`: `(K, M)` complex, or `(K, T, M)` if provided (optional direct link)
 
 ## Configuration Guide
 
@@ -93,6 +95,7 @@ All knobs live in `utils/config.py`. Key options:
 - `use_user_pilot_snr_hetero`, `pilot_snr_dB_min`, `pilot_snr_dB_max`
 - `use_user_alpha_hetero`, `alpha_user_min`, `alpha_user_max`
 - `use_dynamic_alpha`, `dynamic_alpha_mode`, `alpha_min`, `alpha_max`, `alpha_period_rounds`, `alpha_piecewise`
+- `link_switch` `[reflect, direct]`: `[1,0]` reflection only, `[0,1]` direct only (no RIS), `[1,1]` both, `[0,0]` invalid
 
 ## Outputs and Logging
 
