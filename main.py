@@ -23,6 +23,22 @@ def main():
     np.random.seed(0)
     torch.manual_seed(0)
 
+    link_switch = getattr(config, "link_switch", [1, 0])
+    if link_switch is None or len(link_switch) != 2:
+        raise ValueError("Config.link_switch must be length-2: [reflect, direct]")
+    reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
+    if (reflect_on not in (0, 1)) or (direct_on not in (0, 1)):
+        raise ValueError("Config.link_switch elements must be 0 or 1")
+    if reflect_on == 0 and direct_on == 0:
+        raise ValueError("Config.link_switch [0,0] is invalid")
+    mode_desc = "reflection only" if (reflect_on == 1 and direct_on == 0) else \
+        "direct only (no RIS)" if (reflect_on == 0 and direct_on == 1) else "reflection + direct"
+    logger.info(f"Link switch [reflect,direct]={list(link_switch)} -> {mode_desc}")
+    if reflect_on == 0:
+        logger.info("Reflection link disabled: RIS contribution set to 0.")
+    if direct_on == 0:
+        logger.info("Direct link disabled.")
+
     # Per-user pilot observation noise (SNR heterogeneity)
     if getattr(config, "use_user_pilot_snr_hetero", False):
         snr_pilot_db = np.random.uniform(config.pilot_snr_dB_min, config.pilot_snr_dB_max,
@@ -34,6 +50,7 @@ def main():
     logger.info(
         f"Pilot SNR_dB per user: min={snr_pilot_db.min():.2f}, mean={snr_pilot_db.mean():.2f}, max={snr_pilot_db.max():.2f}")
 
+    h_BUs = None
     if config.use_synthetic_data:
         H_BR = (np.random.randn(config.num_ris_elements, config.num_bs_antennas) +
                 1j * np.random.randn(config.num_ris_elements, config.num_bs_antennas)) / np.sqrt(2)
@@ -46,8 +63,12 @@ def main():
             h_RUs[k] = (np.random.randn(config.num_ris_elements) + 1j * np.random.randn(
                 config.num_ris_elements)) / np.sqrt(2)
 
+        if direct_on == 1:
+            h_BUs = (np.random.randn(config.num_users, config.num_bs_antennas) +
+                     1j * np.random.randn(config.num_users, config.num_bs_antennas)) / np.sqrt(2)
+
     else:
-        H_BR, h_RUs_static = deepmimo.load_data(config.deepmimo_path, num_users=config.num_users)
+        H_BR, h_RUs_static, h_BUs_static = deepmimo.load_data(config.deepmimo_path, num_users=config.num_users)
 
         # Use initial loaded channels and simulate variation via AR(1)
         H_BR = H_BR.astype(np.complex64)
@@ -58,6 +79,16 @@ def main():
             h_RUs = h_RUs_static[:, 0, :].astype(np.complex64)
 
         theta_pattern = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
+        if direct_on == 1:
+            if h_BUs_static is None:
+                logger.info("Direct link enabled but h_BU not found in dataset; using synthetic BS-UE channels.")
+                h_BUs = (np.random.randn(config.num_users, config.num_bs_antennas) +
+                         1j * np.random.randn(config.num_users, config.num_bs_antennas)) / np.sqrt(2)
+            else:
+                if h_BUs_static.ndim == 2:
+                    h_BUs = h_BUs_static.astype(np.complex64)
+                else:
+                    h_BUs = h_BUs_static[:, 0, :].astype(np.complex64)
 
     # Set initial BS beamforming vector f (e.g., all ones)
     f_beam = np.ones(config.num_bs_antennas, dtype=np.complex64)
@@ -104,8 +135,13 @@ def main():
         local_data = []
         for k in range(config.num_users):
             # Pilot signals for user k
-            Y_pilot, cascaded = pilot_gen.simulate_pilot_observation(H_BR, h_RUs[k], f_beam, theta_pattern,
-                                                                     noise_std=float(pilot_noise_std_k[k]))
+            h_BU_k = h_BUs[k] if h_BUs is not None else None
+            Y_pilot, cascaded = pilot_gen.simulate_pilot_observation(
+                H_BR, h_RUs[k], f_beam, theta_pattern,
+                noise_std=float(pilot_noise_std_k[k]),
+                h_BU=h_BU_k,
+                link_switch=link_switch,
+            )
 
             # Build GRU sequence input: X_seq shape (W, 2, P) --> (seq_len, 2, obs_dim)
 

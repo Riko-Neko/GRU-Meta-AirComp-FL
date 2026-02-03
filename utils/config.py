@@ -14,6 +14,10 @@ class Config:
     num_ris_elements = 64  # number of RIS elements (N)
     num_pilots = 16  # number of pilot transmissions per time slot (P)
 
+    # Link switch: [reflection, direct]
+    # [1,0] reflection only (default), [0,1] direct only (no RIS), [1,1] both, [0,0] invalid
+    link_switch = [1, 0]
+
     # channel settings (RIS->UE link, RU)
     channel_alpha = 0.9  # AR(1)
     use_user_alpha_hetero = True  # User-level channel dynamic difficulty (alpha_k heterogeneity)
