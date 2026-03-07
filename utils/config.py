@@ -9,10 +9,18 @@ class Config:
     use_synthetic_data = True  # whether to generate synthetic data (if False, use DeepMIMO data)
     deepmimo_path = "DeepMIMO_O1.npy"  # path to DeepMIMO dataset file (if use_synthetic_data is False)
     num_users = 10  # number of users (K)
-    # num_times = 16                     # number of time steps (W) for synthetic data or sequence length
     num_bs_antennas = 32  # number of BS antennas (M)
     num_ris_elements = 64  # number of RIS elements (N)
     num_pilots = 16  # number of pilot transmissions per time slot (P)
+
+    # Path-loss settings (synthetic mode)
+    alpha_direct = 3.0  # path-loss exponent for BS-UE
+    alpha_ris = 2.2  # path-loss exponent for RIS-UE (effective)
+    d_direct_min = 50.0
+    d_direct_max = 150.0
+    d_ris_min = 50.0
+    d_ris_max = 150.0
+    channel_ref_scale = math.sqrt(1e-10)  # match baseline normalization ref=(1e-10)^0.5
 
     # Link switch: [reflection, direct]
     # [1,0] reflection only (default), [0,1] direct only (no RIS), [1,1] both, [0,0] invalid
@@ -20,18 +28,20 @@ class Config:
 
     # channel settings (RIS->UE link, RU)
     channel_alpha = 0.9  # AR(1)
-    use_user_alpha_hetero = True  # User-level channel dynamic difficulty (alpha_k heterogeneity)
-    alpha_user_min = 0.60
-    alpha_user_max = 0.98
     use_dynamic_alpha = False
     dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
     alpha_min = 0.50
     alpha_max = 0.98
     alpha_period_rounds = 20
-    alpha_piecewise = [(10, 0.98), (25, 0.85), (40, 0.60), (50, 0.90)]
+    alpha_piecewise = [(5, 0.98), (10, 0.85), (15, 0.60), (20, 0.90)]
 
-    # Pilot observation noise (per-user heterogeneity)
-    use_user_pilot_snr_hetero = True
+    # per-user heterogeneity
+    # channel dynamic (alpha_k heterogeneity)
+    use_user_alpha_hetero = False
+    alpha_user_min = 0.60
+    alpha_user_max = 0.98
+    # Pilot observation noise
+    use_user_pilot_snr_hetero = False
     pilot_SNR_dB = 20
     pilot_snr_dB_min = 10
     pilot_snr_dB_max = 30
@@ -41,14 +51,18 @@ class Config:
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
 
+    # CNN ablation settings (minimal-intrusion comparison branch)
+    enable_cnn_ablation = False  # if True, train CNN-ablation on the same per-round samples as CNN+GRU
+    cnn_ablation_pool_mode = "mean"  # "mean" or "last"
+
     # Local sample cache (per-user) for stable local training
     use_local_sample_cache = True
     local_cache_size = 8  # S sample cached per-user
 
     # Federated learning settings
-    num_rounds = 50  # number of communication rounds
-    local_epochs = 5  # local update epochs per round (per user)
-    local_lr = 1e-4  # learning rate for local training
+    num_rounds = 100  # number of communication rounds
+    local_epochs = 3  # local update epochs per round (per user)
+    local_lr = 1e-3  # learning rate for local training
     batch_size = 32  # batch size for local training (None means use all data per epoch)
     meta_algorithm = "Reptile"  # Meta-FL algorithm ("Reptile" or "FedAvg")
     reptile_step_size = 0.1  # step size (beta) for Reptile algorithm (if applicable)
@@ -56,8 +70,17 @@ class Config:
     # AirComp and communication settings
     use_aircomp = True  # whether to simulate AirComp aggregation with noise
     SNR_dB = 20  # SNR in dB for AirComp (if use_aircomp is True)
-    noise_std = math.pow(10,
-                         - (SNR_dB / 20.0))  # noise standard deviation (amplitude) computed from SNR_dB (20 dB -> ~0.1)
+    noise_std = math.pow(10, - (SNR_dB / 20.0))  # noise standard deviation from SNR_dB (20 dB -> ~0.1)
+    # OTA aggregation settings (Phase1)
+    ota_tx_power = 0.1
+    ota_var_floor = 1e-3
+    ota_eps = 1e-8
+    ota_user_weight = 1.0  # scalar base weight; Phase1 uses uniform by default
+    ota_noise_std = noise_std
+    ota_use_weighted_users = True
+    user_weight_mode = "uniform"  # "uniform" or "random"
+    user_data_size_min = 5000
+    user_data_size_max = 20000
 
     # Logging settings
     log_to_file = True  # whether to save logs to a file

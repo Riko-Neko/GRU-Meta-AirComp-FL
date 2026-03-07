@@ -1,40 +1,66 @@
 import torch
 import numpy as np
 
+
 class AirCompSimulator:
     """
-    Simulator for over-the-air aggregation.
-    Simulates the summation of local updates over wireless channels with noise.
+    Physical-domain OTA aggregation (Phase1, no device selection).
+    Implements mean/var normalization + power-limited pre-equalization proxy.
     """
-    def __init__(self, noise_std=0.0):
+    def __init__(self, noise_std=0.0, tx_power=0.1, var_floor=1e-3, eps=1e-8):
         self.noise_std = noise_std
-    
-    def aggregate(self, param_sum_dict, num_devices):
+        self.tx_power = tx_power
+        self.var_floor = var_floor
+        self.eps = eps
+
+    def aggregate_updates(self, updates, h_eff, user_weights, noise_std=None):
         """
-        Given a dictionary of summed parameters (sum of all devices' parameters),
-        add noise and divide by number of devices to simulate AirComp aggregated average.
-        Returns a dictionary of aggregated (noisy) average parameters.
+        updates: tensor [K, d], real
+        h_eff: tensor [K], complex, effective channel f^H h_k
+        user_weights: tensor [K], usually K_k
+        noise_std: optional override
+        Returns: agg_update [d], real; diagnostics dict
         """
-        agg_state = {}
-        for key, summed_val in param_sum_dict.items():
-            # Add Gaussian noise to summed parameters
-            if self.noise_std > 0:
-                noise = torch.normal(mean=0.0, std=self.noise_std, size=summed_val.shape)
-                summed_val = summed_val + noise
-            # Divide by number of devices to get average
-            agg_state[key] = summed_val / num_devices
-        return agg_state
-    
-    def aggregate_sum(self, param_sum_dict):
-        """
-        Add noise to the summed parameters without dividing by number of devices.
-        Useful if we want to handle averaging outside (e.g., for Reptile).
-        """
-        noisy_sum = {}
-        for key, summed_val in param_sum_dict.items():
-            if self.noise_std > 0:
-                noise = torch.normal(mean=0.0, std=self.noise_std, size=summed_val.shape)
-                noisy_sum[key] = summed_val + noise
-            else:
-                noisy_sum[key] = summed_val
-        return noisy_sum
+        if noise_std is None:
+            noise_std = self.noise_std
+        K, d = updates.shape
+        device = updates.device
+
+        # per-user stats
+        mean_k = updates.mean(dim=1, keepdim=True)         # [K,1]
+        var_k = updates.var(dim=1, keepdim=True, unbiased=False)  # [K,1]
+        var_k = torch.clamp(var_k, min=self.var_floor)
+        var_sqrt = torch.sqrt(var_k)
+
+        # weights
+        K_vec = user_weights.to(device).reshape(K, 1)      # [K,1]
+
+        # eta (alignment / power limit proxy)
+        inner2 = torch.abs(h_eff)**2 + self.eps            # [K]
+        eta_candidates = self.tx_power * inner2 / (K_vec.view(-1) ** 2 * var_k.view(-1))
+        eta = torch.min(eta_candidates).real
+        eta_sqrt = torch.sqrt(torch.clamp(eta, min=self.eps))
+
+        # pre-equalization
+        b_k = K_vec * eta_sqrt * var_sqrt * h_eff.conj().unsqueeze(1) / (inner2.unsqueeze(1) + self.eps)
+        x_signal = b_k / var_sqrt * (updates - mean_k)     # [K,d]
+
+        # noise
+        noise_power = (noise_std ** 2) * self.tx_power
+        noise = torch.randn(d, device=device) * np.sqrt(noise_power / 2) + \
+            1j * torch.randn(d, device=device) * np.sqrt(noise_power / 2)
+
+        y = (h_eff.unsqueeze(1) * x_signal).sum(dim=0) + noise  # [d] complex
+        g_bar = (K_vec * mean_k).sum().real                     # scalar
+        sumK = K_vec.sum().real + self.eps
+        w_hat = (y / eta_sqrt + g_bar) / sumK                   # complex
+
+        # We need a real update vector (model params are real)
+        agg_update = w_hat.real
+
+        diagnostics = {
+            "eta": eta.item(),
+            "min_inner2": inner2.min().item(),
+            "noise_power": noise_power,
+        }
+        return agg_update, diagnostics

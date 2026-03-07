@@ -24,6 +24,7 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     Returns:
     - Y_pilot: numpy array of shape (P,) complex received pilot observations.
     - cascaded_channel: numpy array of shape (N,) complex cascaded channel (element-wise BS-RIS-user product).
+    - direct_effective: complex scalar direct-link projection after beamforming (f^H h_d).
     """
     if link_switch is None:
         link_switch = (1, 0)
@@ -35,11 +36,10 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     if reflect_on == 0 and direct_on == 0:
         raise ValueError(f"Link is invalid: {link_switch}")
 
-    # Effective BS->RIS channel with beamforming
-    # If BS has multiple antennas, combine with f_beam
-    g = H_BR.dot(f_beam)  # shape (N,)
-    # Cascaded channel per RIS element: product of BS-RIS and RIS-user channels
-    cascaded = g * h_RU  # shape (N,), complex
+    # Effective BS->RIS channel seen after receive beamforming: f^H H_BR
+    cascaded_prefix = f_beam.conj() @ H_BR.T  # shape (N,)
+    # Cascaded channel per RIS element after beamforming
+    cascaded = cascaded_prefix * h_RU  # shape (N,), complex
 
     if reflect_on == 0:
         cascaded = np.zeros_like(cascaded)
@@ -53,13 +53,14 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     if reflect_on == 1:
         Y = Y + theta_pattern.dot(cascaded)  # shape (P,), complex
 
+    direct_eff = 0.0 + 0.0j
+    if direct_on == 1 and h_BU is not None:
+        # Direct link projected by receive beamformer: f^H h_d
+        direct_eff = f_beam.conj().dot(h_BU)
     if direct_on == 1:
-        direct_eff = 0.0
-        if h_BU is not None:
-            direct_eff = h_BU.dot(f_beam)
         Y = Y + direct_eff
 
     if noise_std > 0:
         noise = (np.random.randn(P) + 1j * np.random.randn(P)) * (noise_std / np.sqrt(2))
         Y = Y + noise
-    return Y, cascaded
+    return Y, cascaded, direct_eff
