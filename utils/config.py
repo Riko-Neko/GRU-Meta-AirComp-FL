@@ -37,7 +37,7 @@ class Config:
 
     # per-user heterogeneity
     # channel dynamic (alpha_k heterogeneity)
-    use_user_alpha_hetero = False
+    use_user_alpha_hetero = True
     alpha_user_min = 0.60
     alpha_user_max = 0.98
     # Pilot observation noise
@@ -51,8 +51,15 @@ class Config:
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
 
+    # Stateful GRU settings (single-step online update)
+    use_persistent_hidden_state = True
+    stateful_single_step_input = True
+    reset_hidden_on_round1 = True
+    reset_hidden_on_large_backbone_update = False
+    hidden_reset_update_norm_threshold = 0.5
+
     # CNN ablation settings (minimal-intrusion comparison branch)
-    enable_cnn_ablation = False  # if True, train CNN-ablation on the same per-round samples as CNN+GRU
+    enable_cnn_ablation = True  # if True, train CNN-ablation with an independent physical-layer optimization state
     cnn_ablation_pool_mode = "mean"  # "mean" or "last"
 
     # Local sample cache (per-user) for stable local training
@@ -110,6 +117,7 @@ class Config:
     @classmethod
     def log_prefix(cls) -> str:
         return (f"K{cls.num_users}_M{cls.num_bs_antennas}_N{cls.num_ris_elements}_"
-                f"P{cls.num_pilots}_W{getattr(cls, 'window_length', 'NA')}_"
-                f"S{getattr(cls, 'local_cache_size', 'NA')}_{cls.meta_algorithm}"
+                f"P{cls.num_pilots}_W{cls.window_length}_"
+                f"S{cls.local_cache_size}_{cls.meta_algorithm}_"
+                f"PH{int(bool(cls.use_persistent_hidden_state))}"
                 )

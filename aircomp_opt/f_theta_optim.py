@@ -81,11 +81,8 @@ def optimize_beam_ris(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, lin
         scatter = np.zeros((M, M), dtype=np.complex128)
         for user_idx, hk in enumerate(hk_list):
             scatter += weakness[user_idx] * np.outer(hk, hk.conj())
-        try:
-            eigvals, eigvecs = np.linalg.eigh(scatter)
-            f_vec = eigvecs[:, np.argmax(eigvals)]
-        except np.linalg.LinAlgError:
-            f_vec = hk_list[int(np.argmin(eta_candidates))]
+        eigvals, eigvecs = np.linalg.eigh(scatter)
+        f_vec = eigvecs[:, np.argmax(eigvals)]
         f_vec = _normalize_vector(f_vec, fallback=f_init)
 
     _, h_eff, _ = _compute_effective_channels(H_BR, h_RUs, f_vec, theta_vec, h_BUs, reflect_on, direct_on)

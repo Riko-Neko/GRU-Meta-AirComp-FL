@@ -132,26 +132,26 @@ class RUChannelEvolverAR1:
 
 def build_ru_channel_evolver_from_config(config):
     traj_cfg = AlphaTrajectoryConfig(
-        use_dynamic_alpha=getattr(config, "use_dynamic_alpha", False),
-        static_alpha=getattr(config, "channel_alpha", 0.8),
-        dynamic_alpha_mode=getattr(config, "dynamic_alpha_mode", "sinusoid"),
-        alpha_min=getattr(config, "alpha_min", 0.5),
-        alpha_max=getattr(config, "alpha_max", 0.98),
-        alpha_period_rounds=getattr(config, "alpha_period_rounds", 20),
-        alpha_piecewise=getattr(config, "alpha_piecewise", None),
+        use_dynamic_alpha=config.use_dynamic_alpha,
+        static_alpha=config.channel_alpha,
+        dynamic_alpha_mode=config.dynamic_alpha_mode,
+        alpha_min=config.alpha_min,
+        alpha_max=config.alpha_max,
+        alpha_period_rounds=config.alpha_period_rounds,
+        alpha_piecewise=config.alpha_piecewise,
     )
     traj = AlphaTrajectory(traj_cfg)
 
     alpha_bases = None
-    if getattr(config, "use_user_alpha_hetero", False):
-        a_min = float(getattr(config, "alpha_user_min", traj_cfg.static_alpha))
-        a_max = float(getattr(config, "alpha_user_max", traj_cfg.static_alpha))
-        K = int(getattr(config, "num_users", 0))
+    if config.use_user_alpha_hetero:
+        a_min = float(config.alpha_user_min)
+        a_max = float(config.alpha_user_max)
+        K = int(config.num_users)
         alpha_bases = np.random.uniform(a_min, a_max, size=(K,)).astype(float)
 
     return RUChannelEvolverAR1(
         num_ris_elements=config.num_ris_elements,
         traj=traj,
         alpha_bases=alpha_bases,
-        base_static_alpha=getattr(config, "channel_alpha", traj_cfg.static_alpha),
+        base_static_alpha=config.channel_alpha,
     )

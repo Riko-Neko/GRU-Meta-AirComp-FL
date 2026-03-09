@@ -26,13 +26,7 @@ def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0,
     - cascaded_channel: numpy array of shape (N,) complex cascaded channel (element-wise BS-RIS-user product).
     - direct_effective: complex scalar direct-link projection after beamforming (f^H h_d).
     """
-    if link_switch is None:
-        link_switch = (1, 0)
-    if len(link_switch) != 2:
-        raise ValueError("link_switch must be length-2: [reflect, direct]")
     reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
-    if (reflect_on not in (0, 1)) or (direct_on not in (0, 1)):
-        raise ValueError("link_switch elements must be 0 or 1")
     if reflect_on == 0 and direct_on == 0:
         raise ValueError(f"Link is invalid: {link_switch}")
 

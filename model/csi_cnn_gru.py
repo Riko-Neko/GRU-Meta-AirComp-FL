@@ -22,21 +22,38 @@ class CSICNNGRU(nn.Module):
         # Head: single linear layer kept per-user (not OTA-aggregated)
         self.head = nn.Linear(hidden_size, output_dim)
 
-    def forward_backbone(self, x):
+    def forward_backbone(self, x, h0=None, return_hidden=False):
         """Return shared representation from conv+GRU backbone."""
         batch_size, seq_len, _, obs_dim = x.shape
         x_reshaped = x.view(batch_size * seq_len, 2, obs_dim)
         conv_out = self.relu(self.backbone_conv(x_reshaped))
         conv_out = conv_out.view(batch_size * seq_len, -1)
         conv_out_seq = conv_out.view(batch_size, seq_len, -1)
-        gru_out, _ = self.backbone_gru(conv_out_seq)
+        if h0 is None:
+            gru_out, h_n = self.backbone_gru(conv_out_seq)
+        else:
+            gru_out, h_n = self.backbone_gru(conv_out_seq, h0)
         final_out = gru_out[:, -1, :]  # (batch, hidden_size)
+        if return_hidden:
+            return final_out, h_n
         return final_out
 
     def forward_head(self, feat):
         """Apply per-user head to backbone features."""
         return self.head(feat)
 
-    def forward(self, x):
-        feat = self.forward_backbone(x)
+    def forward(self, x, h0=None, return_hidden=False):
+        if return_hidden:
+            feat, h_n = self.forward_backbone(x, h0=h0, return_hidden=True)
+            return self.forward_head(feat), h_n
+        feat = self.forward_backbone(x, h0=h0, return_hidden=False)
         return self.forward_head(feat)
+
+    def forward_step(self, x_step, h0=None, return_hidden=False):
+        """
+        Stateful single-step forward.
+        x_step: (batch, 2, obs_dim) or (batch, 1, 2, obs_dim)
+        """
+        if x_step.dim() == 3:
+            x_step = x_step.unsqueeze(1)  # (batch, 1, 2, obs_dim)
+        return self.forward(x_step, h0=h0, return_hidden=return_hidden)

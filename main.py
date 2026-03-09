@@ -29,12 +29,8 @@ def main():
     np.random.seed(0)
     torch.manual_seed(0)
 
-    link_switch = getattr(config, "link_switch", [1, 0])
-    if link_switch is None or len(link_switch) != 2:
-        raise ValueError("Config.link_switch must be length-2: [reflect, direct]")
+    link_switch = config.link_switch
     reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
-    if (reflect_on not in (0, 1)) or (direct_on not in (0, 1)):
-        raise ValueError("Config.link_switch elements must be 0 or 1")
     if reflect_on == 0 and direct_on == 0:
         raise ValueError("Config.link_switch [0,0] is invalid")
     mode_desc = "reflection only" if (reflect_on == 1 and direct_on == 0) else \
@@ -46,11 +42,11 @@ def main():
         logger.info("Direct link disabled.")
 
     # Per-user pilot observation noise (SNR heterogeneity)
-    if getattr(config, "use_user_pilot_snr_hetero", False):
+    if config.use_user_pilot_snr_hetero:
         snr_pilot_db = np.random.uniform(config.pilot_snr_dB_min, config.pilot_snr_dB_max,
                                          size=(config.num_users,)).astype(float)
     else:
-        snr_pilot_db = np.full((config.num_users,), float(getattr(config, "pilot_SNR_dB", 20.0)), dtype=float)
+        snr_pilot_db = np.full((config.num_users,), float(config.pilot_SNR_dB), dtype=float)
 
     pilot_noise_std_k = np.power(10.0, -snr_pilot_db / 20.0)  # amplitude std
     logger.info(
@@ -59,7 +55,7 @@ def main():
     h_BUs = None
     if config.use_synthetic_data:
         # Strictly align baseline main.py: Rayleigh H_BR and channel scaling by ref
-        ref = float(getattr(config, "channel_ref_scale", np.sqrt(1e-10)))
+        ref = float(config.channel_ref_scale)
         H_BR = ((np.random.randn(config.num_ris_elements, config.num_bs_antennas) +
                  1j * np.random.randn(config.num_ris_elements, config.num_bs_antennas)) / np.sqrt(2)).astype(
             np.complex64)
@@ -68,14 +64,14 @@ def main():
         theta_ota = np.ones(config.num_ris_elements, dtype=np.complex64)
 
         # Path-loss samples (no explicit geometry; distances drawn from ranges)
-        d_dir = np.random.uniform(getattr(config, "d_direct_min", 50.0),
-                                  getattr(config, "d_direct_max", 150.0),
+        d_dir = np.random.uniform(config.d_direct_min,
+                                  config.d_direct_max,
                                   size=(config.num_users,))
-        d_ris = np.random.uniform(getattr(config, "d_ris_min", 50.0),
-                                  getattr(config, "d_ris_max", 150.0),
+        d_ris = np.random.uniform(config.d_ris_min,
+                                  config.d_ris_max,
                                   size=(config.num_users,))
-        pl_direct = np.power(d_dir, -float(getattr(config, "alpha_direct", 3.0)))  # per-user
-        pl_ris = np.power(d_ris, -float(getattr(config, "alpha_ris", 2.2)))        # per-user
+        pl_direct = np.power(d_dir, -float(config.alpha_direct))  # per-user
+        pl_ris = np.power(d_ris, -float(config.alpha_ris))        # per-user
 
         # Initialize user channels (at time 0)
         h_RUs = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64)
@@ -125,27 +121,46 @@ def main():
     output_dim = 2 * (config.num_ris_elements + 1)
 
     # Per-user sliding window buffer for GRU
-    W = int(getattr(config, "window_length", 1))
-    use_time_window = bool(getattr(config, "use_time_window", False))
-    pad_val = float(getattr(config, "window_pad_value", 0.0))
+    W = int(config.window_length)
+    use_time_window = bool(config.use_time_window)
+    pad_val = float(config.window_pad_value)
+    use_persistent_hidden_state = bool(config.use_persistent_hidden_state)
+    stateful_single_step_input = bool(config.stateful_single_step_input)
+    reset_hidden_on_round1 = bool(config.reset_hidden_on_round1)
+    reset_hidden_on_large_backbone_update = bool(config.reset_hidden_on_large_backbone_update)
+    hidden_reset_update_norm_threshold = float(config.hidden_reset_update_norm_threshold)
+    if use_persistent_hidden_state and not stateful_single_step_input:
+        logger.info("stateful_single_step_input=False is not supported; fallback to single-step mode.")
+        stateful_single_step_input = True
 
     obs_buffers = [deque(maxlen=W) for _ in range(config.num_users)]
-    logger.info(f"GRU time-window enabled={use_time_window}, W={W}")
+    logger.info(
+        f"GRU mode: persistent_hidden={use_persistent_hidden_state}, "
+        f"time_window={use_time_window}, W={W}"
+    )
     # Per-user local sample cache: store last S window-samples (X_seq, y)
-    S = int(getattr(config, "local_cache_size", 1))
-    use_local_cache = bool(getattr(config, "use_local_sample_cache", False)) and (S > 1)
+    S = int(config.local_cache_size)
+    use_local_cache = bool(config.use_local_sample_cache) and (S > 1)
     sample_buffers = [deque(maxlen=S) for _ in range(config.num_users)]
     logger.info(f"Local sample cache enabled={use_local_cache}, S={S}")
+    if use_persistent_hidden_state and use_local_cache:
+        logger.info("Persistent-hidden GRU path bypasses local sample cache (single-step online update).")
     global_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
+    user_hidden_states = [None for _ in range(config.num_users)]
+    reset_hidden_next_round = False
     # For warm-start heads: keep a global head template to clone for users
     global_head_state = {k: v.clone() for k, v in global_model.state_dict().items() if k.startswith("head")}
     user_head_states = [copy.deepcopy(global_head_state) for _ in range(config.num_users)]
 
-    enable_cnn_ablation = bool(getattr(config, "enable_cnn_ablation", False))
-    ablation_pool_mode = str(getattr(config, "cnn_ablation_pool_mode", "mean")).lower()
+    enable_cnn_ablation = bool(config.enable_cnn_ablation)
+    ablation_pool_mode = str(config.cnn_ablation_pool_mode).lower()
     global_model_ablation = None
     user_head_states_ablation = None
     aggregator_ablation = None
+    f_beam_ablation = None
+    theta_ota_ablation = None
+    obs_buffers_ablation = None
+    sample_buffers_ablation = None
     if enable_cnn_ablation:
         global_model_ablation = CSICNNAblation(
             observation_dim=obs_dim,
@@ -169,19 +184,24 @@ def main():
                 use_aircomp=False,
                 aircomp_simulator=None,
             )
+        f_beam_ablation = f_beam.copy()
+        theta_ota_ablation = theta_ota.copy()
+        obs_buffers_ablation = [deque(maxlen=W) for _ in range(config.num_users)]
+        sample_buffers_ablation = [deque(maxlen=S) for _ in range(config.num_users)]
         logger.info(
             f"CNN ablation enabled=True, pool_mode={ablation_pool_mode}. "
-            f"Training shares the same per-round samples as CNN+GRU."
+            "Training shares the same channel/user realization, but keeps an independent "
+            "physical-layer optimization state."
         )
 
     # OTA simulator (Phase1 physical aggregation)
     aircomp_sim = None
     if config.use_aircomp:
         aircomp_sim = AirCompSimulator(
-            noise_std=getattr(config, "ota_noise_std", config.noise_std),
-            tx_power=getattr(config, "ota_tx_power", 0.1),
-            var_floor=getattr(config, "ota_var_floor", 1e-3),
-            eps=getattr(config, "ota_eps", 1e-8),
+            noise_std=config.ota_noise_std,
+            tx_power=config.ota_tx_power,
+            var_floor=config.ota_var_floor,
+            eps=config.ota_eps,
         )
     # Fallback aggregator for non-OTA path
     if config.meta_algorithm.lower() == "reptile":
@@ -196,8 +216,15 @@ def main():
 
     for round_idx in range(1, config.num_rounds + 1):
         logger.info(f"\033[32mRound {round_idx}\033[0m - Generating pilot observations.")
+        if use_persistent_hidden_state:
+            if (round_idx == 1 and reset_hidden_on_round1) or reset_hidden_next_round:
+                user_hidden_states = [None for _ in range(config.num_users)]
+                reason = "round1" if (round_idx == 1 and reset_hidden_on_round1) else "large_backbone_update"
+                logger.info(f"Reset persistent hidden states at round {round_idx} (reason={reason}).")
+                reset_hidden_next_round = False
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
+        local_data_ablation = [] if enable_cnn_ablation else None
         for k in range(config.num_users):
             # Pilot signals for user k
             h_BU_k = h_BUs[k] if h_BUs is not None else None
@@ -214,31 +241,75 @@ def main():
             obs_imag = np.imag(Y_pilot)
             obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
 
-            if use_time_window and W > 1:
-                obs_buffers[k].append(obs_step)  # append current step
-                seq = list(obs_buffers[k])  # list of (2,P), length <= W
-                X_seq = np.stack(seq, axis=0)  # (len, 2, P)
-
-                # Pad to fixed W (left-padding)
-                if X_seq.shape[0] < W:
-                    pad_len = W - X_seq.shape[0]
-                    pad = np.full((pad_len, 2, obs_dim), pad_val, dtype=np.float32)
-                    X_seq = np.concatenate([pad, X_seq], axis=0)  # (W, 2, P)
+            if use_persistent_hidden_state and stateful_single_step_input:
+                X_seq = obs_step[None, :, :]  # (1, 2, P), one newly received step only
             else:
-                # Fallback: seq_len = 1
-                X_seq = obs_step[None, :, :]  # (1, 2, P)
+                if use_time_window and W > 1:
+                    obs_buffers[k].append(obs_step)  # append current step
+                    seq = list(obs_buffers[k])  # list of (2,P), length <= W
+                    X_seq = np.stack(seq, axis=0)  # (len, 2, P)
+
+                    # Pad to fixed W (left-padding)
+                    if X_seq.shape[0] < W:
+                        pad_len = W - X_seq.shape[0]
+                        pad = np.full((pad_len, 2, obs_dim), pad_val, dtype=np.float32)
+                        X_seq = np.concatenate([pad, X_seq], axis=0)  # (W, 2, P)
+                else:
+                    # Fallback: seq_len = 1
+                    X_seq = obs_step[None, :, :]  # (1, 2, P)
 
             total_effective = np.concatenate([cascaded, np.asarray([direct_eff], dtype=cascaded.dtype)], axis=0)
             y = np.concatenate([np.real(total_effective), np.imag(total_effective)], axis=0).astype(np.float32)
             sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
             local_data.append(sample)
 
-            if use_time_window and W > 1 and round_idx <= 3 and k == 0:
+            if (not use_persistent_hidden_state) and use_time_window and W > 1 and round_idx <= 3 and k == 0:
                 logger.info(f"Example X_seq shape for user1: {sample[0].shape}")  # (W,2,P)
 
             # push into local cache
-            if use_local_cache:
+            if use_local_cache and (not use_persistent_hidden_state):
                 sample_buffers[k].append((sample[0].copy(), sample[1].copy()))  # copy for safety
+
+            if enable_cnn_ablation:
+                Y_pilot_ablation, cascaded_ablation, direct_eff_ablation = pilot_gen.simulate_pilot_observation(
+                    H_BR, h_RUs[k], f_beam_ablation, theta_pilot,
+                    noise_std=float(pilot_noise_std_k[k]),
+                    h_BU=h_BU_k,
+                    link_switch=link_switch,
+                )
+
+                obs_real_ablation = np.real(Y_pilot_ablation)
+                obs_imag_ablation = np.imag(Y_pilot_ablation)
+                obs_step_ablation = np.stack([obs_real_ablation, obs_imag_ablation], axis=0).astype(np.float32)
+
+                if use_time_window and W > 1:
+                    obs_buffers_ablation[k].append(obs_step_ablation)
+                    seq_ablation = list(obs_buffers_ablation[k])
+                    X_seq_ablation = np.stack(seq_ablation, axis=0)
+
+                    if X_seq_ablation.shape[0] < W:
+                        pad_len_ablation = W - X_seq_ablation.shape[0]
+                        pad_ablation = np.full((pad_len_ablation, 2, obs_dim), pad_val, dtype=np.float32)
+                        X_seq_ablation = np.concatenate([pad_ablation, X_seq_ablation], axis=0)
+                else:
+                    X_seq_ablation = obs_step_ablation[None, :, :]
+
+                total_effective_ablation = np.concatenate(
+                    [cascaded_ablation, np.asarray([direct_eff_ablation], dtype=cascaded_ablation.dtype)],
+                    axis=0,
+                )
+                y_ablation = np.concatenate(
+                    [np.real(total_effective_ablation), np.imag(total_effective_ablation)],
+                    axis=0,
+                ).astype(np.float32)
+                sample_ablation = (
+                    X_seq_ablation.astype(np.float32, copy=False),
+                    y_ablation.astype(np.float32, copy=False),
+                )
+                local_data_ablation.append(sample_ablation)
+
+                if use_local_cache:
+                    sample_buffers_ablation[k].append((sample_ablation[0].copy(), sample_ablation[1].copy()))
 
         # Local training on each user's data
         local_models = []
@@ -256,12 +327,22 @@ def main():
             local_model.load_state_dict(state)
 
             # Train on user k's data
-            if use_local_cache:
-                data_k = list(sample_buffers[k])  # latest S window samples, OK if length < S
+            if use_persistent_hidden_state:
+                sample_k = local_data[k]
+                local_model, loss, hidden_next = trainer.train_stateful_step(
+                    local_model,
+                    sample_k,
+                    hidden_state=user_hidden_states[k],
+                )
+                user_hidden_states[k] = hidden_next
+                if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
+                    logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
             else:
-                data_k = [local_data[k]]  # fallback: 1 sample per epoch
-
-            local_model, loss = trainer.train(local_model, data_k)
+                if use_local_cache:
+                    data_k = list(sample_buffers[k])  # latest S window samples, OK if length < S
+                else:
+                    data_k = [local_data[k]]  # fallback: 1 sample per epoch
+                local_model, loss = trainer.train(local_model, data_k)
             losses.append(loss if loss is not None else 0.0)
             local_models.append(local_model)
             # cache back the personalized head for user k
@@ -277,7 +358,12 @@ def main():
                     state_ablation[hk] = hv.clone()
                 local_model_ablation.load_state_dict(state_ablation)
 
-                local_model_ablation, loss_ablation = trainer.train(local_model_ablation, data_k)
+                if use_local_cache:
+                    data_k_ablation = list(sample_buffers_ablation[k])
+                else:
+                    data_k_ablation = [local_data_ablation[k]]
+
+                local_model_ablation, loss_ablation = trainer.train(local_model_ablation, data_k_ablation)
                 losses_ablation.append(loss_ablation if loss_ablation is not None else 0.0)
                 local_models_ablation.append(local_model_ablation)
                 user_head_states_ablation[k] = {
@@ -312,13 +398,13 @@ def main():
             old_global_vec_ablation = state_dict_to_vector_backbone(global_model_ablation).detach().cpu()
 
         # User weights K_k for both OTA aggregation and the OTA-aware optimizer.
-        if getattr(config, "ota_use_weighted_users", True):
-            if getattr(config, "user_weight_mode", "uniform") == "random":
-                K_vals = np.random.uniform(getattr(config, "user_data_size_min", 5000),
-                                           getattr(config, "user_data_size_max", 20000),
+        if config.ota_use_weighted_users:
+            if config.user_weight_mode == "random":
+                K_vals = np.random.uniform(config.user_data_size_min,
+                                           config.user_data_size_max,
                                            size=(config.num_users,))
             else:
-                K_vals = np.full((config.num_users,), float(getattr(config, "ota_user_weight", 1.0)))
+                K_vals = np.full((config.num_users,), float(config.ota_user_weight))
         else:
             K_vals = np.ones((config.num_users,), dtype=float)
         K_vec = torch.from_numpy(K_vals.astype(np.float32))
@@ -331,11 +417,24 @@ def main():
             delta_list.append(model_delta_to_vector_backbone(lm, global_model).detach().cpu())
         delta_mat = torch.stack(delta_list, dim=0)  # [K, d]
         delta_var = delta_mat.float().var(dim=1, unbiased=False)
-        delta_var = torch.clamp(delta_var, min=float(getattr(config, "ota_var_floor", 1e-3)))
+        delta_var = torch.clamp(delta_var, min=float(config.ota_var_floor))
+
+        delta_mat_ablation = None
+        delta_var_ablation = None
+        if enable_cnn_ablation:
+            delta_list_ablation = []
+            for lm in local_models_ablation:
+                delta_list_ablation.append(
+                    model_delta_to_vector_backbone(lm, global_model_ablation).detach().cpu()
+                )
+            delta_mat_ablation = torch.stack(delta_list_ablation, dim=0)  # [K, d]
+            delta_var_ablation = delta_mat_ablation.float().var(dim=1, unbiased=False)
+            delta_var_ablation = torch.clamp(delta_var_ablation, min=float(config.ota_var_floor))
 
         h_eff = None
+        h_eff_ablation = None
         if config.use_aircomp and aircomp_sim is not None:
-            # Effective channels per user (complex) using theta_ota; reused by ablation branch.
+            # Effective channels per user (complex) using each branch's own OTA variables.
             casc_pref = f_beam.conj() @ H_BR.T
             h_eff_list = []
             for k in range(config.num_users):
@@ -345,6 +444,19 @@ def main():
                     reflect = np.dot(theta_ota, casc_pref * h_RUs[k])
                 h_eff_list.append(direct + reflect)
             h_eff = torch.from_numpy(np.asarray(h_eff_list, dtype=np.complex64))
+
+            if enable_cnn_ablation:
+                casc_pref_ablation = f_beam_ablation.conj() @ H_BR.T
+                h_eff_list_ablation = []
+                for k in range(config.num_users):
+                    direct_ablation = (
+                        f_beam_ablation.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
+                    )
+                    reflect_ablation = 0.0
+                    if reflect_on == 1:
+                        reflect_ablation = np.dot(theta_ota_ablation, casc_pref_ablation * h_RUs[k])
+                    h_eff_list_ablation.append(direct_ablation + reflect_ablation)
+                h_eff_ablation = torch.from_numpy(np.asarray(h_eff_list_ablation, dtype=np.complex64))
 
         if config.use_aircomp and aircomp_sim is not None:
             agg_update, diag = aircomp_sim.aggregate_updates(
@@ -371,21 +483,22 @@ def main():
             global_model = aggregator.aggregate(global_model, local_models, backbone_only=True, prefix="backbone")
 
         new_global_vec = state_dict_to_vector_backbone(global_model).detach().cpu()
-        logger.info(f"GRU global backbone update norm: {torch.norm(new_global_vec - old_global_vec).item():.4e}")
+        backbone_update_norm = torch.norm(new_global_vec - old_global_vec).item()
+        logger.info(f"GRU global backbone update norm: {backbone_update_norm:.4e}")
+        if use_persistent_hidden_state and reset_hidden_on_large_backbone_update:
+            if backbone_update_norm > hidden_reset_update_norm_threshold:
+                reset_hidden_next_round = True
+                logger.info(
+                    "Persistent hidden states will be reset next round: "
+                    f"update_norm={backbone_update_norm:.4e} > threshold={hidden_reset_update_norm_threshold:.4e}"
+                )
 
         if enable_cnn_ablation:
             logger.info("Aggregating CNN-ablation updates at server.")
-            delta_list_ablation = []
-            for lm in local_models_ablation:
-                delta_list_ablation.append(
-                    model_delta_to_vector_backbone(lm, global_model_ablation).detach().cpu()
-                )
-            delta_mat_ablation = torch.stack(delta_list_ablation, dim=0)  # [K, d]
-
             if config.use_aircomp and aircomp_sim is not None:
                 agg_update_ablation, diag_ablation = aircomp_sim.aggregate_updates(
                     updates=delta_mat_ablation.float(),
-                    h_eff=h_eff,
+                    h_eff=h_eff_ablation,
                     user_weights=K_norm,
                 )
                 ideal_update_ablation = (
@@ -429,19 +542,35 @@ def main():
             H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota, f_init=f_beam,
             link_switch=link_switch, user_weights=K_norm.numpy(),
             update_vars=delta_var.numpy(),
-            tx_power=getattr(config, "ota_tx_power", 0.1),
-            noise_std=getattr(config, "ota_noise_std", config.noise_std),
-            var_floor=getattr(config, "ota_var_floor", 1e-3),
-            eps=getattr(config, "ota_eps", 1e-8),
+            tx_power=config.ota_tx_power,
+            noise_std=config.ota_noise_std,
+            var_floor=config.ota_var_floor,
+            eps=config.ota_eps,
         )
         # New pilot pattern independent from OTA theta
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
         logger.info(f"Optimized f: {np.round(f_beam, 4)}")
         logger.info(f"Optimized theta_ota: {np.round(theta_ota, 4)}, proxy_NMSE={nmse_proxy:.4e}")
 
+        if enable_cnn_ablation:
+            f_beam_ablation, theta_ota_ablation, nmse_proxy_ablation = optimize_beam_ris(
+                H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota_ablation, f_init=f_beam_ablation,
+                link_switch=link_switch, user_weights=K_norm.numpy(),
+                update_vars=delta_var_ablation.numpy(),
+                tx_power=config.ota_tx_power,
+                noise_std=config.ota_noise_std,
+                var_floor=config.ota_var_floor,
+                eps=config.ota_eps,
+            )
+            logger.info(f"Optimized f (CNN-abl): {np.round(f_beam_ablation, 4)}")
+            logger.info(
+                f"Optimized theta_ota (CNN-abl): {np.round(theta_ota_ablation, 4)}, "
+                f"proxy_NMSE={nmse_proxy_ablation:.4e}"
+            )
+
         # Evolve channels for next round (AR(1) with optional dynamic alpha(t))
         h_RUs, alpha_used = ru_evolver.step(h_RUs, round_idx)  # alpha_used: (K,)
-        if getattr(config, "use_dynamic_alpha", False):
+        if config.use_dynamic_alpha:
             logger.info(f"RU dynamic alpha(t) (mode={config.dynamic_alpha_mode}): {alpha_used}, "
                         f"min={alpha_used.min():.4f}, max={alpha_used.max():.4f}"
                         )

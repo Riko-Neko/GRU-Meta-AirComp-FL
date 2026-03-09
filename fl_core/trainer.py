@@ -69,3 +69,36 @@ class GRUTrainer:
                 count += 1
         mse = total_loss / count if count > 0 else 0.0
         return mse
+
+    def train_stateful_step(self, model, sample, hidden_state=None):
+        """
+        Stateful single-step local update.
+        sample: (X, y), where X has shape (1, 2, obs_dim) or (seq_len, 2, obs_dim).
+        hidden_state: previous local hidden state (num_layers, 1, hidden_size), CPU tensor or None.
+        Returns: (model, final_loss, hidden_next_cpu_detached)
+        """
+        model.to(self.device)
+        model.train()
+        optimizer = optim.Adam(model.parameters(), lr=self.learning_rate)
+        X, y = sample
+        X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, seq_len, 2, obs_dim)
+        y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        h_prev = None
+        if hidden_state is not None:
+            h_prev = hidden_state.detach().to(self.device)
+
+        final_loss = None
+        for _ in range(self.epochs):
+            optimizer.zero_grad()
+            outputs, _ = model(X_tensor, h0=h_prev, return_hidden=True)
+            loss = self.criterion(outputs, y_tensor)
+            loss.backward()
+            optimizer.step()
+            final_loss = loss.item()
+
+        model.eval()
+        with torch.no_grad():
+            _, hidden_next = model(X_tensor, h0=h_prev, return_hidden=True)
+        model.train()
+        return model, final_loss, hidden_next.detach().cpu()

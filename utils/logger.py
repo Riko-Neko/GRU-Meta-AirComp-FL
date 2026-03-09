@@ -9,17 +9,8 @@ class Logger:
         if config is not None:
             os.makedirs(log_dir, exist_ok=True)
 
-            prefix = getattr(config, "log_prefix", None)
-            fp = getattr(config, "fingerprint", None)
-            if callable(prefix):
-                prefix = prefix()
-            if callable(fp):
-                fp = fp()
-
-            if not prefix:
-                prefix = "run"
-            if not fp:
-                fp = "cfg"
+            prefix = config.log_prefix()
+            fp = config.fingerprint()
 
             log_file = os.path.join(log_dir, f"{prefix}_{fp}.log")
 
