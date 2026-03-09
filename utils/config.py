@@ -16,10 +16,10 @@ class Config:
     # Path-loss settings (synthetic mode)
     alpha_direct = 3.0  # path-loss exponent for BS-UE
     alpha_ris = 2.2  # path-loss exponent for RIS-UE (effective)
-    d_direct_min = 50.0
+    d_direct_min = 100.0
     d_direct_max = 150.0
     d_ris_min = 50.0
-    d_ris_max = 150.0
+    d_ris_max = 100.0
     channel_ref_scale = math.sqrt(1e-10)  # match baseline normalization ref=(1e-10)^0.5
 
     # Link switch: [reflection, direct]
@@ -28,7 +28,7 @@ class Config:
 
     # channel settings (RIS->UE link, RU)
     channel_alpha = 0.9  # AR(1)
-    use_dynamic_alpha = False
+    use_dynamic_alpha = True
     dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
     alpha_min = 0.50
     alpha_max = 0.98
@@ -41,26 +41,31 @@ class Config:
     alpha_user_min = 0.60
     alpha_user_max = 0.98
     # Pilot observation noise
-    use_user_pilot_snr_hetero = False
+    use_user_pilot_snr_hetero = True
     pilot_SNR_dB = 20
     pilot_snr_dB_min = 10
     pilot_snr_dB_max = 30
 
-    # GRU time-window settings
-    use_time_window = True
+    # GRU context settings
+    gru_context_mode = "persistent_hidden" # "persistent_hidden" | "time_window"
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
-
-    # Stateful GRU settings (single-step online update)
-    use_persistent_hidden_state = True
-    stateful_single_step_input = True
     reset_hidden_on_round1 = True
     reset_hidden_on_large_backbone_update = False
     hidden_reset_update_norm_threshold = 0.5
 
-    # CNN ablation settings (minimal-intrusion comparison branch)
-    enable_cnn_ablation = True  # if True, train CNN-ablation with an independent physical-layer optimization state
-    cnn_ablation_pool_mode = "mean"  # "mean" or "last"
+    # Literature-style CNN baseline settings
+    enable_cnn_baseline = True
+    cnn_baseline_conv_filters = 16
+    cnn_baseline_conv_kernel = 3
+    cnn_baseline_hidden_size = 64
+
+    # Pure architecture ablation (replace GRU backbone with non-stateful CNN)
+    enable_cnn_arch_ablation = True
+    cnn_arch_conv_filters = 8
+    cnn_arch_conv_kernel = 3
+    cnn_arch_hidden_size = 32
+    cnn_arch_pool_mode = "last"  # "last" or "mean"
 
     # Local sample cache (per-user) for stable local training
     use_local_sample_cache = True
@@ -119,5 +124,5 @@ class Config:
         return (f"K{cls.num_users}_M{cls.num_bs_antennas}_N{cls.num_ris_elements}_"
                 f"P{cls.num_pilots}_W{cls.window_length}_"
                 f"S{cls.local_cache_size}_{cls.meta_algorithm}_"
-                f"PH{int(bool(cls.use_persistent_hidden_state))}"
+                f"CTX{cls.gru_context_mode}"
                 )

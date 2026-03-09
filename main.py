@@ -11,12 +11,15 @@ from data.channel import build_ru_channel_evolver_from_config
 from fl_core.agg import MetaUpdater
 from fl_core.reptile_agg import ReptileAggregator
 from fl_core.model_vector import (
+    state_dict_to_vector,
     state_dict_to_vector_backbone,
+    model_delta_to_vector,
     model_delta_to_vector_backbone,
 )
 from fl_core.trainer import GRUTrainer
 from model.csi_cnn_gru import CSICNNGRU
-from model.csi_cnn_ablation import CSICNNAblation
+from model.csi_cnn_arch import CSICNNArch
+from model.csi_cnn_baseline import CSICNNBaseline
 from utils.config import Config
 from utils.logger import Logger
 
@@ -122,21 +125,19 @@ def main():
 
     # Per-user sliding window buffer for GRU
     W = int(config.window_length)
-    use_time_window = bool(config.use_time_window)
     pad_val = float(config.window_pad_value)
-    use_persistent_hidden_state = bool(config.use_persistent_hidden_state)
-    stateful_single_step_input = bool(config.stateful_single_step_input)
+    gru_context_mode = str(config.gru_context_mode).lower()
+    if gru_context_mode not in {"persistent_hidden", "time_window"}:
+        raise ValueError("Config.gru_context_mode must be 'persistent_hidden' or 'time_window'")
+    use_persistent_hidden_state = (gru_context_mode == "persistent_hidden")
+    use_time_window = (gru_context_mode == "time_window")
     reset_hidden_on_round1 = bool(config.reset_hidden_on_round1)
     reset_hidden_on_large_backbone_update = bool(config.reset_hidden_on_large_backbone_update)
     hidden_reset_update_norm_threshold = float(config.hidden_reset_update_norm_threshold)
-    if use_persistent_hidden_state and not stateful_single_step_input:
-        logger.info("stateful_single_step_input=False is not supported; fallback to single-step mode.")
-        stateful_single_step_input = True
 
     obs_buffers = [deque(maxlen=W) for _ in range(config.num_users)]
     logger.info(
-        f"GRU mode: persistent_hidden={use_persistent_hidden_state}, "
-        f"time_window={use_time_window}, W={W}"
+        f"GRU context mode={gru_context_mode}, W={W}"
     )
     # Per-user local sample cache: store last S window-samples (X_seq, y)
     S = int(config.local_cache_size)
@@ -152,46 +153,73 @@ def main():
     global_head_state = {k: v.clone() for k, v in global_model.state_dict().items() if k.startswith("head")}
     user_head_states = [copy.deepcopy(global_head_state) for _ in range(config.num_users)]
 
-    enable_cnn_ablation = bool(config.enable_cnn_ablation)
-    ablation_pool_mode = str(config.cnn_ablation_pool_mode).lower()
-    global_model_ablation = None
-    user_head_states_ablation = None
-    aggregator_ablation = None
-    f_beam_ablation = None
-    theta_ota_ablation = None
-    obs_buffers_ablation = None
-    sample_buffers_ablation = None
-    if enable_cnn_ablation:
-        global_model_ablation = CSICNNAblation(
+    enable_cnn_arch_ablation = bool(config.enable_cnn_arch_ablation)
+    global_model_arch = None
+    user_head_states_arch = None
+    aggregator_arch = None
+    f_beam_arch = None
+    theta_ota_arch = None
+    obs_buffers_arch = None
+    sample_buffers_arch = None
+    if enable_cnn_arch_ablation:
+        global_model_arch = CSICNNArch(
             observation_dim=obs_dim,
             output_dim=output_dim,
-            pool_mode=ablation_pool_mode,
+            conv_filters=int(config.cnn_arch_conv_filters),
+            conv_kernel=int(config.cnn_arch_conv_kernel),
+            hidden_size=int(config.cnn_arch_hidden_size),
+            pool_mode=str(config.cnn_arch_pool_mode),
         )
-        global_head_state_ablation = {
-            k: v.clone() for k, v in global_model_ablation.state_dict().items() if k.startswith("head")
+        global_head_state_arch = {
+            k: v.clone() for k, v in global_model_arch.state_dict().items() if k.startswith("head")
         }
-        user_head_states_ablation = [copy.deepcopy(global_head_state_ablation) for _ in range(config.num_users)]
+        user_head_states_arch = [copy.deepcopy(global_head_state_arch) for _ in range(config.num_users)]
+        obs_buffers_arch = [deque(maxlen=W) for _ in range(config.num_users)]
+        sample_buffers_arch = [deque(maxlen=S) for _ in range(config.num_users)]
         if config.meta_algorithm.lower() == "reptile":
-            aggregator_ablation = ReptileAggregator(
+            aggregator_arch = ReptileAggregator(
                 step_size=config.reptile_step_size,
                 use_aircomp=False,
                 aircomp_simulator=None,
             )
         else:
-            aggregator_ablation = MetaUpdater(
+            aggregator_arch = MetaUpdater(
                 meta_algorithm="FedAvg",
                 step_size=1.0,
                 use_aircomp=False,
                 aircomp_simulator=None,
             )
-        f_beam_ablation = f_beam.copy()
-        theta_ota_ablation = theta_ota.copy()
-        obs_buffers_ablation = [deque(maxlen=W) for _ in range(config.num_users)]
-        sample_buffers_ablation = [deque(maxlen=S) for _ in range(config.num_users)]
+        f_beam_arch = f_beam.copy()
+        theta_ota_arch = theta_ota.copy()
         logger.info(
-            f"CNN ablation enabled=True, pool_mode={ablation_pool_mode}. "
-            "Training shares the same channel/user realization, but keeps an independent "
-            "physical-layer optimization state."
+            "CNN architecture ablation enabled=True "
+            "(replace GRU with non-stateful CNN, keep FL/OTA/physics mechanism unchanged)."
+        )
+
+    enable_cnn_baseline = bool(config.enable_cnn_baseline)
+    global_model_baseline = None
+    aggregator_baseline = None
+    f_beam_baseline = None
+    theta_ota_baseline = None
+    if enable_cnn_baseline:
+        global_model_baseline = CSICNNBaseline(
+            observation_dim=obs_dim,
+            output_dim=output_dim,
+            conv_filters=int(config.cnn_baseline_conv_filters),
+            conv_kernel=int(config.cnn_baseline_conv_kernel),
+            hidden_size=int(config.cnn_baseline_hidden_size),
+        )
+        aggregator_baseline = MetaUpdater(
+            meta_algorithm="FedAvg",
+            step_size=1.0,
+            use_aircomp=False,
+            aircomp_simulator=None,
+        )
+        f_beam_baseline = f_beam.copy()
+        theta_ota_baseline = theta_ota.copy()
+        logger.info(
+            "Literature CNN baseline enabled=True "
+            "(single-step input, full-model FedAvg, non-stateful)."
         )
 
     # OTA simulator (Phase1 physical aggregation)
@@ -224,7 +252,8 @@ def main():
                 reset_hidden_next_round = False
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
-        local_data_ablation = [] if enable_cnn_ablation else None
+        local_data_arch = [] if enable_cnn_arch_ablation else None
+        local_data_baseline = [] if enable_cnn_baseline else None
         for k in range(config.num_users):
             # Pilot signals for user k
             h_BU_k = h_BUs[k] if h_BUs is not None else None
@@ -241,7 +270,7 @@ def main():
             obs_imag = np.imag(Y_pilot)
             obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
 
-            if use_persistent_hidden_state and stateful_single_step_input:
+            if use_persistent_hidden_state:
                 X_seq = obs_step[None, :, :]  # (1, 2, P), one newly received step only
             else:
                 if use_time_window and W > 1:
@@ -270,53 +299,85 @@ def main():
             if use_local_cache and (not use_persistent_hidden_state):
                 sample_buffers[k].append((sample[0].copy(), sample[1].copy()))  # copy for safety
 
-            if enable_cnn_ablation:
-                Y_pilot_ablation, cascaded_ablation, direct_eff_ablation = pilot_gen.simulate_pilot_observation(
-                    H_BR, h_RUs[k], f_beam_ablation, theta_pilot,
+            if enable_cnn_arch_ablation:
+                Y_pilot_arch, cascaded_arch, direct_eff_arch = pilot_gen.simulate_pilot_observation(
+                    H_BR, h_RUs[k], f_beam_arch, theta_pilot,
                     noise_std=float(pilot_noise_std_k[k]),
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
 
-                obs_real_ablation = np.real(Y_pilot_ablation)
-                obs_imag_ablation = np.imag(Y_pilot_ablation)
-                obs_step_ablation = np.stack([obs_real_ablation, obs_imag_ablation], axis=0).astype(np.float32)
+                obs_real_arch = np.real(Y_pilot_arch)
+                obs_imag_arch = np.imag(Y_pilot_arch)
+                obs_step_arch = np.stack([obs_real_arch, obs_imag_arch], axis=0).astype(np.float32)
 
+                # No state is used in architecture ablation.
+                # Input mode follows GRU context setting: single-step or window.
                 if use_time_window and W > 1:
-                    obs_buffers_ablation[k].append(obs_step_ablation)
-                    seq_ablation = list(obs_buffers_ablation[k])
-                    X_seq_ablation = np.stack(seq_ablation, axis=0)
-
-                    if X_seq_ablation.shape[0] < W:
-                        pad_len_ablation = W - X_seq_ablation.shape[0]
-                        pad_ablation = np.full((pad_len_ablation, 2, obs_dim), pad_val, dtype=np.float32)
-                        X_seq_ablation = np.concatenate([pad_ablation, X_seq_ablation], axis=0)
+                    obs_buffers_arch[k].append(obs_step_arch)
+                    seq_arch = list(obs_buffers_arch[k])
+                    X_seq_arch = np.stack(seq_arch, axis=0)
+                    if X_seq_arch.shape[0] < W:
+                        pad_len_arch = W - X_seq_arch.shape[0]
+                        pad_arch = np.full((pad_len_arch, 2, obs_dim), pad_val, dtype=np.float32)
+                        X_seq_arch = np.concatenate([pad_arch, X_seq_arch], axis=0)
                 else:
-                    X_seq_ablation = obs_step_ablation[None, :, :]
+                    X_seq_arch = obs_step_arch[None, :, :]  # (1, 2, P)
 
-                total_effective_ablation = np.concatenate(
-                    [cascaded_ablation, np.asarray([direct_eff_ablation], dtype=cascaded_ablation.dtype)],
+                total_effective_arch = np.concatenate(
+                    [cascaded_arch, np.asarray([direct_eff_arch], dtype=cascaded_arch.dtype)],
                     axis=0,
                 )
-                y_ablation = np.concatenate(
-                    [np.real(total_effective_ablation), np.imag(total_effective_ablation)],
+                y_arch = np.concatenate(
+                    [np.real(total_effective_arch), np.imag(total_effective_arch)],
                     axis=0,
                 ).astype(np.float32)
-                sample_ablation = (
-                    X_seq_ablation.astype(np.float32, copy=False),
-                    y_ablation.astype(np.float32, copy=False),
+                sample_arch = (
+                    X_seq_arch.astype(np.float32, copy=False),
+                    y_arch.astype(np.float32, copy=False),
                 )
-                local_data_ablation.append(sample_ablation)
+                local_data_arch.append(sample_arch)
+                if use_local_cache and use_time_window and W > 1:
+                    sample_buffers_arch[k].append((sample_arch[0].copy(), sample_arch[1].copy()))
 
-                if use_local_cache:
-                    sample_buffers_ablation[k].append((sample_ablation[0].copy(), sample_ablation[1].copy()))
+            if enable_cnn_baseline:
+                Y_pilot_baseline, cascaded_baseline, direct_eff_baseline = pilot_gen.simulate_pilot_observation(
+                    H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
+                    noise_std=float(pilot_noise_std_k[k]),
+                    h_BU=h_BU_k,
+                    link_switch=link_switch,
+                )
+
+                # Literature baseline uses memoryless single-step pilot input.
+                obs_real_baseline = np.real(Y_pilot_baseline)
+                obs_imag_baseline = np.imag(Y_pilot_baseline)
+                obs_step_baseline = np.stack([obs_real_baseline, obs_imag_baseline], axis=0).astype(np.float32)
+                X_seq_baseline = obs_step_baseline[None, :, :]  # (1, 2, P)
+
+                total_effective_baseline = np.concatenate(
+                    [cascaded_baseline, np.asarray([direct_eff_baseline], dtype=cascaded_baseline.dtype)],
+                    axis=0,
+                )
+                y_baseline = np.concatenate(
+                    [np.real(total_effective_baseline), np.imag(total_effective_baseline)],
+                    axis=0,
+                ).astype(np.float32)
+                sample_baseline = (
+                    X_seq_baseline.astype(np.float32, copy=False),
+                    y_baseline.astype(np.float32, copy=False),
+                )
+                local_data_baseline.append(sample_baseline)
 
         # Local training on each user's data
         local_models = []
         losses = []
-        local_models_ablation = [] if enable_cnn_ablation else None
-        losses_ablation = [] if enable_cnn_ablation else None
+        local_models_arch = [] if enable_cnn_arch_ablation else None
+        losses_arch = [] if enable_cnn_arch_ablation else None
+        local_models_baseline = [] if enable_cnn_baseline else None
+        losses_baseline = [] if enable_cnn_baseline else None
         for k in range(config.num_users):
+            loss_arch = None
+            loss_baseline = None
 
             # Model for user k from global weights
             local_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
@@ -347,55 +408,76 @@ def main():
             local_models.append(local_model)
             # cache back the personalized head for user k
             user_head_states[k] = {name: param.detach().clone() for name, param in local_model.state_dict().items() if name.startswith("head")}
-            if enable_cnn_ablation:
-                local_model_ablation = CSICNNAblation(
+
+            if enable_cnn_arch_ablation:
+                local_model_arch = CSICNNArch(
                     observation_dim=obs_dim,
                     output_dim=output_dim,
-                    pool_mode=ablation_pool_mode,
+                    conv_filters=int(config.cnn_arch_conv_filters),
+                    conv_kernel=int(config.cnn_arch_conv_kernel),
+                    hidden_size=int(config.cnn_arch_hidden_size),
+                    pool_mode=str(config.cnn_arch_pool_mode),
                 )
-                state_ablation = global_model_ablation.state_dict()
-                for hk, hv in user_head_states_ablation[k].items():
-                    state_ablation[hk] = hv.clone()
-                local_model_ablation.load_state_dict(state_ablation)
-
-                if use_local_cache:
-                    data_k_ablation = list(sample_buffers_ablation[k])
+                state_arch = global_model_arch.state_dict()
+                for hk, hv in user_head_states_arch[k].items():
+                    state_arch[hk] = hv.clone()
+                local_model_arch.load_state_dict(state_arch)
+                if use_local_cache and use_time_window and W > 1:
+                    data_k_arch = list(sample_buffers_arch[k])
                 else:
-                    data_k_ablation = [local_data_ablation[k]]
-
-                local_model_ablation, loss_ablation = trainer.train(local_model_ablation, data_k_ablation)
-                losses_ablation.append(loss_ablation if loss_ablation is not None else 0.0)
-                local_models_ablation.append(local_model_ablation)
-                user_head_states_ablation[k] = {
+                    data_k_arch = [local_data_arch[k]]
+                local_model_arch, loss_arch = trainer.train(local_model_arch, data_k_arch)
+                losses_arch.append(loss_arch if loss_arch is not None else 0.0)
+                local_models_arch.append(local_model_arch)
+                user_head_states_arch[k] = {
                     name: param.detach().clone()
-                    for name, param in local_model_ablation.state_dict().items()
+                    for name, param in local_model_arch.state_dict().items()
                     if name.startswith("head")
                 }
-                if (loss is not None) and (loss_ablation is not None):
-                    logger.info(
-                        f"User {k + 1} local loss -> GRU: \033[34m{loss:.4f}\033[0m, "
-                        f"CNN-abl: \033[36m{loss_ablation:.4f}\033[0m"
-                    )
-                else:
-                    logger.info(f"User {k + 1} local training done.")
-            else:
-                logger.info(
-                    f"User {k + 1} local training loss: \033[34m{loss:.4f}\033[0m"
-                    if loss is not None else f"User {k + 1} local training done."
-                )
 
-        if enable_cnn_ablation and losses and losses_ablation:
-            logger.info(
-                f"Round {round_idx} mean local loss -> GRU: {np.mean(losses):.4f}, "
-                f"CNN-abl: {np.mean(losses_ablation):.4f}"
-            )
+            if enable_cnn_baseline:
+                local_model_baseline = CSICNNBaseline(
+                    observation_dim=obs_dim,
+                    output_dim=output_dim,
+                    conv_filters=int(config.cnn_baseline_conv_filters),
+                    conv_kernel=int(config.cnn_baseline_conv_kernel),
+                    hidden_size=int(config.cnn_baseline_hidden_size),
+                )
+                local_model_baseline.load_state_dict(global_model_baseline.state_dict())
+                data_k_baseline = [local_data_baseline[k]]
+                local_model_baseline, loss_baseline = trainer.train(local_model_baseline, data_k_baseline)
+                losses_baseline.append(loss_baseline if loss_baseline is not None else 0.0)
+                local_models_baseline.append(local_model_baseline)
+
+            loss_parts = []
+            if loss is not None:
+                loss_parts.append(f"GRU: \033[34m{loss:.4f}\033[0m")
+            if enable_cnn_arch_ablation and (loss_arch is not None):
+                loss_parts.append(f"CNN-arch: \033[35m{loss_arch:.4f}\033[0m")
+            if enable_cnn_baseline and (loss_baseline is not None):
+                loss_parts.append(f"CNN-base: \033[36m{loss_baseline:.4f}\033[0m")
+            if loss_parts:
+                logger.info(f"User {k + 1} local loss -> " + ", ".join(loss_parts))
+            else:
+                logger.info(f"User {k + 1} local training done.")
+
+        if losses:
+            round_loss_parts = [f"Round {round_idx} mean local loss -> GRU: {np.mean(losses):.4f}"]
+            if enable_cnn_arch_ablation and losses_arch:
+                round_loss_parts.append(f"CNN-arch: {np.mean(losses_arch):.4f}")
+            if enable_cnn_baseline and losses_baseline:
+                round_loss_parts.append(f"CNN-base: {np.mean(losses_baseline):.4f}")
+            logger.info(", ".join(round_loss_parts))
 
         # Aggregate updates at server
         logger.info("Aggregating GRU updates at server.")
         old_global_vec = state_dict_to_vector_backbone(global_model).detach().cpu()
-        old_global_vec_ablation = None
-        if enable_cnn_ablation:
-            old_global_vec_ablation = state_dict_to_vector_backbone(global_model_ablation).detach().cpu()
+        old_global_vec_arch = None
+        if enable_cnn_arch_ablation:
+            old_global_vec_arch = state_dict_to_vector_backbone(global_model_arch).detach().cpu()
+        old_global_vec_baseline = None
+        if enable_cnn_baseline:
+            old_global_vec_baseline = state_dict_to_vector(global_model_baseline).detach().cpu()
 
         # User weights K_k for both OTA aggregation and the OTA-aware optimizer.
         if config.ota_use_weighted_users:
@@ -419,20 +501,33 @@ def main():
         delta_var = delta_mat.float().var(dim=1, unbiased=False)
         delta_var = torch.clamp(delta_var, min=float(config.ota_var_floor))
 
-        delta_mat_ablation = None
-        delta_var_ablation = None
-        if enable_cnn_ablation:
-            delta_list_ablation = []
-            for lm in local_models_ablation:
-                delta_list_ablation.append(
-                    model_delta_to_vector_backbone(lm, global_model_ablation).detach().cpu()
+        delta_mat_arch = None
+        delta_var_arch = None
+        if enable_cnn_arch_ablation:
+            delta_list_arch = []
+            for lm in local_models_arch:
+                delta_list_arch.append(
+                    model_delta_to_vector_backbone(lm, global_model_arch).detach().cpu()
                 )
-            delta_mat_ablation = torch.stack(delta_list_ablation, dim=0)  # [K, d]
-            delta_var_ablation = delta_mat_ablation.float().var(dim=1, unbiased=False)
-            delta_var_ablation = torch.clamp(delta_var_ablation, min=float(config.ota_var_floor))
+            delta_mat_arch = torch.stack(delta_list_arch, dim=0)  # [K, d]
+            delta_var_arch = delta_mat_arch.float().var(dim=1, unbiased=False)
+            delta_var_arch = torch.clamp(delta_var_arch, min=float(config.ota_var_floor))
+
+        delta_mat_baseline = None
+        delta_var_baseline = None
+        if enable_cnn_baseline:
+            delta_list_baseline = []
+            for lm in local_models_baseline:
+                delta_list_baseline.append(
+                    model_delta_to_vector(lm, global_model_baseline).detach().cpu()
+                )
+            delta_mat_baseline = torch.stack(delta_list_baseline, dim=0)  # [K, d]
+            delta_var_baseline = delta_mat_baseline.float().var(dim=1, unbiased=False)
+            delta_var_baseline = torch.clamp(delta_var_baseline, min=float(config.ota_var_floor))
 
         h_eff = None
-        h_eff_ablation = None
+        h_eff_arch = None
+        h_eff_baseline = None
         if config.use_aircomp and aircomp_sim is not None:
             # Effective channels per user (complex) using each branch's own OTA variables.
             casc_pref = f_beam.conj() @ H_BR.T
@@ -445,18 +540,31 @@ def main():
                 h_eff_list.append(direct + reflect)
             h_eff = torch.from_numpy(np.asarray(h_eff_list, dtype=np.complex64))
 
-            if enable_cnn_ablation:
-                casc_pref_ablation = f_beam_ablation.conj() @ H_BR.T
-                h_eff_list_ablation = []
+            if enable_cnn_arch_ablation:
+                casc_pref_arch = f_beam_arch.conj() @ H_BR.T
+                h_eff_list_arch = []
                 for k in range(config.num_users):
-                    direct_ablation = (
-                        f_beam_ablation.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
+                    direct_arch = (
+                        f_beam_arch.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
                     )
-                    reflect_ablation = 0.0
+                    reflect_arch = 0.0
                     if reflect_on == 1:
-                        reflect_ablation = np.dot(theta_ota_ablation, casc_pref_ablation * h_RUs[k])
-                    h_eff_list_ablation.append(direct_ablation + reflect_ablation)
-                h_eff_ablation = torch.from_numpy(np.asarray(h_eff_list_ablation, dtype=np.complex64))
+                        reflect_arch = np.dot(theta_ota_arch, casc_pref_arch * h_RUs[k])
+                    h_eff_list_arch.append(direct_arch + reflect_arch)
+                h_eff_arch = torch.from_numpy(np.asarray(h_eff_list_arch, dtype=np.complex64))
+
+            if enable_cnn_baseline:
+                casc_pref_baseline = f_beam_baseline.conj() @ H_BR.T
+                h_eff_list_baseline = []
+                for k in range(config.num_users):
+                    direct_baseline = (
+                        f_beam_baseline.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
+                    )
+                    reflect_baseline = 0.0
+                    if reflect_on == 1:
+                        reflect_baseline = np.dot(theta_ota_baseline, casc_pref_baseline * h_RUs[k])
+                    h_eff_list_baseline.append(direct_baseline + reflect_baseline)
+                h_eff_baseline = torch.from_numpy(np.asarray(h_eff_list_baseline, dtype=np.complex64))
 
         if config.use_aircomp and aircomp_sim is not None:
             agg_update, diag = aircomp_sim.aggregate_updates(
@@ -493,46 +601,82 @@ def main():
                     f"update_norm={backbone_update_norm:.4e} > threshold={hidden_reset_update_norm_threshold:.4e}"
                 )
 
-        if enable_cnn_ablation:
-            logger.info("Aggregating CNN-ablation updates at server.")
+        if enable_cnn_arch_ablation:
+            logger.info("Aggregating CNN architecture ablation updates at server.")
             if config.use_aircomp and aircomp_sim is not None:
-                agg_update_ablation, diag_ablation = aircomp_sim.aggregate_updates(
-                    updates=delta_mat_ablation.float(),
-                    h_eff=h_eff_ablation,
+                agg_update_arch, diag_arch = aircomp_sim.aggregate_updates(
+                    updates=delta_mat_arch.float(),
+                    h_eff=h_eff_arch,
                     user_weights=K_norm,
                 )
-                ideal_update_ablation = (
-                    (delta_mat_ablation * K_norm.view(-1, 1)).sum(dim=0) / (K_norm.sum() + 1e-12)
+                ideal_update_arch = (
+                    (delta_mat_arch * K_norm.view(-1, 1)).sum(dim=0) / (K_norm.sum() + 1e-12)
                 )
-                agg_error_power_ablation = torch.norm(agg_update_ablation - ideal_update_ablation) ** 2
-                ideal_power_ablation = torch.norm(ideal_update_ablation) ** 2
-                nmse_ablation = agg_error_power_ablation / (ideal_power_ablation + 1e-12)
+                agg_error_power_arch = torch.norm(agg_update_arch - ideal_update_arch) ** 2
+                ideal_power_arch = torch.norm(ideal_update_arch) ** 2
+                nmse_arch = agg_error_power_arch / (ideal_power_arch + 1e-12)
 
-                aggregator_ablation.apply_aggregated_delta(
-                    global_model_ablation,
-                    agg_update_ablation,
+                aggregator_arch.apply_aggregated_delta(
+                    global_model_arch,
+                    agg_update_arch,
                     backbone_only=True,
                     prefix="backbone",
                 )
                 logger.info(
-                    f"CNN-abl AirComp eta={diag_ablation['eta']:.4e}, "
-                    f"min|u|^2={diag_ablation['min_inner2']:.4e}, "
-                    f"agg_NMSE={nmse_ablation.item():.4e}, "
-                    f"agg_err={agg_error_power_ablation.item():.4e}, "
-                    f"ideal_power={ideal_power_ablation.item():.4e}"
+                    f"CNN-arch AirComp eta={diag_arch['eta']:.4e}, "
+                    f"min|u|^2={diag_arch['min_inner2']:.4e}, "
+                    f"agg_NMSE={nmse_arch.item():.4e}, "
+                    f"agg_err={agg_error_power_arch.item():.4e}, "
+                    f"ideal_power={ideal_power_arch.item():.4e}"
                 )
             else:
-                global_model_ablation = aggregator_ablation.aggregate(
-                    global_model_ablation,
-                    local_models_ablation,
+                global_model_arch = aggregator_arch.aggregate(
+                    global_model_arch,
+                    local_models_arch,
                     backbone_only=True,
                     prefix="backbone",
                 )
 
-            new_global_vec_ablation = state_dict_to_vector_backbone(global_model_ablation).detach().cpu()
+            new_global_vec_arch = state_dict_to_vector_backbone(global_model_arch).detach().cpu()
             logger.info(
-                "CNN-abl global backbone update norm: "
-                f"{torch.norm(new_global_vec_ablation - old_global_vec_ablation).item():.4e}"
+                "CNN-arch global backbone update norm: "
+                f"{torch.norm(new_global_vec_arch - old_global_vec_arch).item():.4e}"
+            )
+
+        if enable_cnn_baseline:
+            logger.info("Aggregating literature CNN baseline updates at server.")
+            if config.use_aircomp and aircomp_sim is not None:
+                agg_update_baseline, diag_baseline = aircomp_sim.aggregate_updates(
+                    updates=delta_mat_baseline.float(),
+                    h_eff=h_eff_baseline,
+                    user_weights=K_norm,
+                )
+                ideal_update_baseline = (
+                    (delta_mat_baseline * K_norm.view(-1, 1)).sum(dim=0) / (K_norm.sum() + 1e-12)
+                )
+                agg_error_power_baseline = torch.norm(agg_update_baseline - ideal_update_baseline) ** 2
+                ideal_power_baseline = torch.norm(ideal_update_baseline) ** 2
+                nmse_baseline = agg_error_power_baseline / (ideal_power_baseline + 1e-12)
+
+                aggregator_baseline.apply_aggregated_delta(global_model_baseline, agg_update_baseline, backbone_only=False)
+                logger.info(
+                    f"CNN-base AirComp eta={diag_baseline['eta']:.4e}, "
+                    f"min|u|^2={diag_baseline['min_inner2']:.4e}, "
+                    f"agg_NMSE={nmse_baseline.item():.4e}, "
+                    f"agg_err={agg_error_power_baseline.item():.4e}, "
+                    f"ideal_power={ideal_power_baseline.item():.4e}"
+                )
+            else:
+                global_model_baseline = aggregator_baseline.aggregate(
+                    global_model_baseline,
+                    local_models_baseline,
+                    backbone_only=False,
+                )
+
+            new_global_vec_baseline = state_dict_to_vector(global_model_baseline).detach().cpu()
+            logger.info(
+                "CNN-base global update norm: "
+                f"{torch.norm(new_global_vec_baseline - old_global_vec_baseline).item():.4e}"
             )
 
         # Optimize beamforming vector f and RIS phases theta for next round
@@ -552,20 +696,36 @@ def main():
         logger.info(f"Optimized f: {np.round(f_beam, 4)}")
         logger.info(f"Optimized theta_ota: {np.round(theta_ota, 4)}, proxy_NMSE={nmse_proxy:.4e}")
 
-        if enable_cnn_ablation:
-            f_beam_ablation, theta_ota_ablation, nmse_proxy_ablation = optimize_beam_ris(
-                H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota_ablation, f_init=f_beam_ablation,
+        if enable_cnn_arch_ablation:
+            f_beam_arch, theta_ota_arch, nmse_proxy_arch = optimize_beam_ris(
+                H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota_arch, f_init=f_beam_arch,
                 link_switch=link_switch, user_weights=K_norm.numpy(),
-                update_vars=delta_var_ablation.numpy(),
+                update_vars=delta_var_arch.numpy(),
                 tx_power=config.ota_tx_power,
                 noise_std=config.ota_noise_std,
                 var_floor=config.ota_var_floor,
                 eps=config.ota_eps,
             )
-            logger.info(f"Optimized f (CNN-abl): {np.round(f_beam_ablation, 4)}")
+            logger.info(f"Optimized f (CNN-arch): {np.round(f_beam_arch, 4)}")
             logger.info(
-                f"Optimized theta_ota (CNN-abl): {np.round(theta_ota_ablation, 4)}, "
-                f"proxy_NMSE={nmse_proxy_ablation:.4e}"
+                f"Optimized theta_ota (CNN-arch): {np.round(theta_ota_arch, 4)}, "
+                f"proxy_NMSE={nmse_proxy_arch:.4e}"
+            )
+
+        if enable_cnn_baseline:
+            f_beam_baseline, theta_ota_baseline, nmse_proxy_baseline = optimize_beam_ris(
+                H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota_baseline, f_init=f_beam_baseline,
+                link_switch=link_switch, user_weights=K_norm.numpy(),
+                update_vars=delta_var_baseline.numpy(),
+                tx_power=config.ota_tx_power,
+                noise_std=config.ota_noise_std,
+                var_floor=config.ota_var_floor,
+                eps=config.ota_eps,
+            )
+            logger.info(f"Optimized f (CNN-base): {np.round(f_beam_baseline, 4)}")
+            logger.info(
+                f"Optimized theta_ota (CNN-base): {np.round(theta_ota_baseline, 4)}, "
+                f"proxy_NMSE={nmse_proxy_baseline:.4e}"
             )
 
         # Evolve channels for next round (AR(1) with optional dynamic alpha(t))

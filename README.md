@@ -45,7 +45,9 @@ The model is implemented in a personalized split form:
 ## How It Works (High Level)
 
 1. Generate pilot observations using current `H_BR`, `h_RU`, optional `h_BU`, beam `f`, and RIS phases `theta`.
-2. Build per-user GRU sequences (optionally using a time window and local cache).
+2. Build per-user GRU context according to `gru_context_mode`:
+   `persistent_hidden` uses single-step inputs plus carried hidden states;
+   `time_window` uses an explicit padded window of length `window_length`.
 3. For each user, load global backbone + local cached head (round-1 head is warm-started from global init), then run local training.
 4. Build local update vectors from backbone parameters only.
 5. Aggregate backbone updates at the server with Reptile (or FedAvg), optionally through AirComp noise.
@@ -98,7 +100,7 @@ All knobs live in `utils/config.py`. Key options:
 - `num_rounds`, `local_epochs`, `local_lr`, `batch_size`
 - `meta_algorithm` (`Reptile` or `FedAvg`) and `reptile_step_size`
 - `use_aircomp`, `SNR_dB`, `noise_std`
-- `use_time_window`, `window_length`, `window_pad_value`
+- `gru_context_mode`, `window_length`, `window_pad_value`
 - `use_local_sample_cache`, `local_cache_size`
 - `use_user_pilot_snr_hetero`, `pilot_snr_dB_min`, `pilot_snr_dB_max`
 - `use_user_alpha_hetero`, `alpha_user_min`, `alpha_user_max`
@@ -109,6 +111,7 @@ Personalized split behavior (now default in code):
 - `Backbone` parameters are the only part used to compute OTA/Fed updates.
 - `Head` parameters are cached per user on-device and updated only by that user's local training.
 - Round 1 uses a common warm-start head copied from the same global initialization.
+- `window_pad_value` is used only when `gru_context_mode="time_window"`.
 
 ## Outputs and Logging
 
