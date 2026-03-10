@@ -28,7 +28,7 @@ class Config:
 
     # channel settings (RIS->UE link, RU)
     channel_alpha = 0.9  # AR(1)
-    use_dynamic_alpha = True
+    use_dynamic_alpha = False
     dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
     alpha_min = 0.50
     alpha_max = 0.98
@@ -41,13 +41,17 @@ class Config:
     alpha_user_min = 0.60
     alpha_user_max = 0.98
     # Pilot observation noise
-    use_user_pilot_snr_hetero = True
+    use_user_pilot_snr_hetero = False
     pilot_SNR_dB = 20
     pilot_snr_dB_min = 10
     pilot_snr_dB_max = 30
 
     # GRU context settings
     gru_context_mode = "persistent_hidden" # "persistent_hidden" | "time_window"
+    # CSI supervision target for GRU:
+    # "t"   -> estimate current h_RU(t)
+    # "t+1" -> one-step prediction h_RU(t+1) from current pilots
+    gru_csi_target_mode = "t+1"
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
     reset_hidden_on_round1 = True
@@ -56,9 +60,9 @@ class Config:
 
     # Literature-style CNN baseline settings
     enable_cnn_baseline = True
-    cnn_baseline_conv_filters = 16
+    cnn_baseline_conv_filters = 8
     cnn_baseline_conv_kernel = 3
-    cnn_baseline_hidden_size = 64
+    cnn_baseline_hidden_size = 32
 
     # Pure architecture ablation (replace GRU backbone with non-stateful CNN)
     enable_cnn_arch_ablation = True
@@ -67,7 +71,7 @@ class Config:
     cnn_arch_hidden_size = 32
     cnn_arch_pool_mode = "last"  # "last" or "mean"
 
-    # Local sample cache (per-user) for stable local training
+    # Local sample cache (GRU / CNN-arch only; not used by literature CNN baseline)
     use_local_sample_cache = True
     local_cache_size = 8  # S sample cached per-user
 
@@ -81,7 +85,7 @@ class Config:
 
     # AirComp and communication settings
     use_aircomp = True  # whether to simulate AirComp aggregation with noise
-    SNR_dB = 20  # SNR in dB for AirComp (if use_aircomp is True)
+    SNR_dB = 0  # SNR in dB for AirComp (if use_aircomp is True)
     noise_std = math.pow(10, - (SNR_dB / 20.0))  # noise standard deviation from SNR_dB (20 dB -> ~0.1)
     # OTA aggregation settings (Phase1)
     ota_tx_power = 0.1

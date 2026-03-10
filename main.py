@@ -24,6 +24,47 @@ from utils.config import Config
 from utils.logger import Logger
 
 
+def _parse_gru_target_mode(mode):
+    token = str(mode).strip().lower().replace(" ", "")
+    if token in {"t", "current", "now"}:
+        return "t"
+    if token in {"t+1", "t_plus_1", "next", "t1"}:
+        return "t+1"
+    raise ValueError("Config.gru_csi_target_mode must be 't' or 't+1'")
+
+
+def _complex_to_ri(vec_complex):
+    return np.concatenate([np.real(vec_complex), np.imag(vec_complex)], axis=0).astype(np.float32)
+
+
+def _ri_to_complex(vec_ri, n):
+    vec = np.asarray(vec_ri, dtype=np.float32).reshape(-1)
+    if vec.size != 2 * n:
+        raise ValueError(f"Expected RI vector size {2 * n}, got {vec.size}")
+    return (vec[:n] + 1j * vec[n:]).astype(np.complex64)
+
+
+def _predict_h_ru_gru(model, x_seq, n_ris, hidden_state=None):
+    model.eval()
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        x_tensor = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
+        if hidden_state is not None:
+            pred = model(x_tensor, h0=hidden_state.detach().to(device), return_hidden=False)
+        else:
+            pred = model(x_tensor, return_hidden=False)
+    return _ri_to_complex(pred.squeeze(0).cpu().numpy(), n_ris)
+
+
+def _predict_h_ru_plain(model, x_seq, n_ris):
+    model.eval()
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        x_tensor = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
+        pred = model(x_tensor)
+    return _ri_to_complex(pred.squeeze(0).cpu().numpy(), n_ris)
+
+
 def main():
     config = Config
     logger = Logger(config=config) if config.log_to_file else Logger()
@@ -120,8 +161,9 @@ def main():
     observation_dim = config.num_pilots  # each pilot yields one observation value (if scalar) or we consider multi-dim
     # Actually, each pilot observation is complex, we consider 2 channels (real & imag)
     obs_dim = config.num_pilots
-    # Supervision target aligns with received model: [cascaded_vector, direct_scalar], both complex.
-    output_dim = 2 * (config.num_ris_elements + 1)
+    # Supervision target is RIS-user CSI h_RU (real-imag stacked).
+    output_dim = 2 * config.num_ris_elements
+    gru_csi_target_mode = _parse_gru_target_mode(config.gru_csi_target_mode)
 
     # Per-user sliding window buffer for GRU
     W = int(config.window_length)
@@ -139,12 +181,15 @@ def main():
     logger.info(
         f"GRU context mode={gru_context_mode}, W={W}"
     )
-    # Per-user local sample cache: store last S window-samples (X_seq, y)
+    logger.info(f"GRU CSI target mode={gru_csi_target_mode}")
+    logger.info("CNN-arch/CNN-base CSI target mode=t")
+    # Per-user local sample cache for GRU/CNN-arch only.
+    # Literature CNN baseline stays memoryless and never uses this cache.
     S = int(config.local_cache_size)
-    use_local_cache = bool(config.use_local_sample_cache) and (S > 1)
+    use_local_cache_seq_models = bool(config.use_local_sample_cache) and (S > 1)
     sample_buffers = [deque(maxlen=S) for _ in range(config.num_users)]
-    logger.info(f"Local sample cache enabled={use_local_cache}, S={S}")
-    if use_persistent_hidden_state and use_local_cache:
+    logger.info(f"Local sample cache (GRU/CNN-arch) enabled={use_local_cache_seq_models}, S={S}")
+    if use_persistent_hidden_state and use_local_cache_seq_models:
         logger.info("Persistent-hidden GRU path bypasses local sample cache (single-step online update).")
     global_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
     user_hidden_states = [None for _ in range(config.num_users)]
@@ -221,6 +266,7 @@ def main():
             "Literature CNN baseline enabled=True "
             "(single-step input, full-model FedAvg, non-stateful)."
         )
+        logger.info("Literature CNN baseline local cache is disabled by design.")
 
     # OTA simulator (Phase1 physical aggregation)
     aircomp_sim = None
@@ -250,6 +296,11 @@ def main():
                 reason = "round1" if (round_idx == 1 and reset_hidden_on_round1) else "large_backbone_update"
                 logger.info(f"Reset persistent hidden states at round {round_idx} (reason={reason}).")
                 reset_hidden_next_round = False
+        # Precompute one-step channel evolution once for this round so supervision and
+        # the actual next-round channel transition stay consistent.
+        h_RUs_next, alpha_used_next = ru_evolver.step(h_RUs, round_idx)
+        h_RUs_target_gru = h_RUs_next if gru_csi_target_mode == "t+1" else h_RUs
+
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
         local_data_arch = [] if enable_cnn_arch_ablation else None
@@ -257,7 +308,7 @@ def main():
         for k in range(config.num_users):
             # Pilot signals for user k
             h_BU_k = h_BUs[k] if h_BUs is not None else None
-            Y_pilot, cascaded, direct_eff = pilot_gen.simulate_pilot_observation(
+            Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
                 H_BR, h_RUs[k], f_beam, theta_pilot,
                 noise_std=float(pilot_noise_std_k[k]),
                 h_BU=h_BU_k,
@@ -287,8 +338,7 @@ def main():
                     # Fallback: seq_len = 1
                     X_seq = obs_step[None, :, :]  # (1, 2, P)
 
-            total_effective = np.concatenate([cascaded, np.asarray([direct_eff], dtype=cascaded.dtype)], axis=0)
-            y = np.concatenate([np.real(total_effective), np.imag(total_effective)], axis=0).astype(np.float32)
+            y = _complex_to_ri(h_RUs_target_gru[k])
             sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
             local_data.append(sample)
 
@@ -296,11 +346,11 @@ def main():
                 logger.info(f"Example X_seq shape for user1: {sample[0].shape}")  # (W,2,P)
 
             # push into local cache
-            if use_local_cache and (not use_persistent_hidden_state):
+            if use_local_cache_seq_models and (not use_persistent_hidden_state):
                 sample_buffers[k].append((sample[0].copy(), sample[1].copy()))  # copy for safety
 
             if enable_cnn_arch_ablation:
-                Y_pilot_arch, cascaded_arch, direct_eff_arch = pilot_gen.simulate_pilot_observation(
+                Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_arch, theta_pilot,
                     noise_std=float(pilot_noise_std_k[k]),
                     h_BU=h_BU_k,
@@ -324,24 +374,17 @@ def main():
                 else:
                     X_seq_arch = obs_step_arch[None, :, :]  # (1, 2, P)
 
-                total_effective_arch = np.concatenate(
-                    [cascaded_arch, np.asarray([direct_eff_arch], dtype=cascaded_arch.dtype)],
-                    axis=0,
-                )
-                y_arch = np.concatenate(
-                    [np.real(total_effective_arch), np.imag(total_effective_arch)],
-                    axis=0,
-                ).astype(np.float32)
+                y_arch = _complex_to_ri(h_RUs[k])
                 sample_arch = (
                     X_seq_arch.astype(np.float32, copy=False),
                     y_arch.astype(np.float32, copy=False),
                 )
                 local_data_arch.append(sample_arch)
-                if use_local_cache and use_time_window and W > 1:
+                if use_local_cache_seq_models and use_time_window and W > 1:
                     sample_buffers_arch[k].append((sample_arch[0].copy(), sample_arch[1].copy()))
 
             if enable_cnn_baseline:
-                Y_pilot_baseline, cascaded_baseline, direct_eff_baseline = pilot_gen.simulate_pilot_observation(
+                Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
                     noise_std=float(pilot_noise_std_k[k]),
                     h_BU=h_BU_k,
@@ -354,14 +397,7 @@ def main():
                 obs_step_baseline = np.stack([obs_real_baseline, obs_imag_baseline], axis=0).astype(np.float32)
                 X_seq_baseline = obs_step_baseline[None, :, :]  # (1, 2, P)
 
-                total_effective_baseline = np.concatenate(
-                    [cascaded_baseline, np.asarray([direct_eff_baseline], dtype=cascaded_baseline.dtype)],
-                    axis=0,
-                )
-                y_baseline = np.concatenate(
-                    [np.real(total_effective_baseline), np.imag(total_effective_baseline)],
-                    axis=0,
-                ).astype(np.float32)
+                y_baseline = _complex_to_ri(h_RUs[k])
                 sample_baseline = (
                     X_seq_baseline.astype(np.float32, copy=False),
                     y_baseline.astype(np.float32, copy=False),
@@ -375,6 +411,11 @@ def main():
         losses_arch = [] if enable_cnn_arch_ablation else None
         local_models_baseline = [] if enable_cnn_baseline else None
         losses_baseline = [] if enable_cnn_baseline else None
+        h_RUs_est = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64)
+        h_RUs_est_arch = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64) \
+            if enable_cnn_arch_ablation else None
+        h_RUs_est_baseline = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64) \
+            if enable_cnn_baseline else None
         for k in range(config.num_users):
             loss_arch = None
             loss_baseline = None
@@ -390,20 +431,33 @@ def main():
             # Train on user k's data
             if use_persistent_hidden_state:
                 sample_k = local_data[k]
+                hidden_prev = user_hidden_states[k]
                 local_model, loss, hidden_next = trainer.train_stateful_step(
                     local_model,
                     sample_k,
-                    hidden_state=user_hidden_states[k],
+                    hidden_state=hidden_prev,
                 )
                 user_hidden_states[k] = hidden_next
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
+                h_RUs_est[k] = _predict_h_ru_gru(
+                    local_model,
+                    sample_k[0],
+                    config.num_ris_elements,
+                    hidden_state=hidden_prev,
+                )
             else:
-                if use_local_cache:
+                if use_local_cache_seq_models:
                     data_k = list(sample_buffers[k])  # latest S window samples, OK if length < S
                 else:
                     data_k = [local_data[k]]  # fallback: 1 sample per epoch
                 local_model, loss = trainer.train(local_model, data_k)
+                h_RUs_est[k] = _predict_h_ru_gru(
+                    local_model,
+                    local_data[k][0],
+                    config.num_ris_elements,
+                    hidden_state=None,
+                )
             losses.append(loss if loss is not None else 0.0)
             local_models.append(local_model)
             # cache back the personalized head for user k
@@ -422,13 +476,18 @@ def main():
                 for hk, hv in user_head_states_arch[k].items():
                     state_arch[hk] = hv.clone()
                 local_model_arch.load_state_dict(state_arch)
-                if use_local_cache and use_time_window and W > 1:
+                if use_local_cache_seq_models and use_time_window and W > 1:
                     data_k_arch = list(sample_buffers_arch[k])
                 else:
                     data_k_arch = [local_data_arch[k]]
                 local_model_arch, loss_arch = trainer.train(local_model_arch, data_k_arch)
                 losses_arch.append(loss_arch if loss_arch is not None else 0.0)
                 local_models_arch.append(local_model_arch)
+                h_RUs_est_arch[k] = _predict_h_ru_plain(
+                    local_model_arch,
+                    local_data_arch[k][0],
+                    config.num_ris_elements,
+                )
                 user_head_states_arch[k] = {
                     name: param.detach().clone()
                     for name, param in local_model_arch.state_dict().items()
@@ -448,6 +507,11 @@ def main():
                 local_model_baseline, loss_baseline = trainer.train(local_model_baseline, data_k_baseline)
                 losses_baseline.append(loss_baseline if loss_baseline is not None else 0.0)
                 local_models_baseline.append(local_model_baseline)
+                h_RUs_est_baseline[k] = _predict_h_ru_plain(
+                    local_model_baseline,
+                    local_data_baseline[k][0],
+                    config.num_ris_elements,
+                )
 
             loss_parts = []
             if loss is not None:
@@ -681,9 +745,9 @@ def main():
 
         # Optimize beamforming vector f and RIS phases theta for next round
         logger.info("Optimizing beamforming and RIS configuration.")
-        # Use current true channels for optimization (in real scenario, would use estimated channels)
+        # Use model-estimated h_RU for OTA beam/RIS optimization.
         f_beam, theta_ota, nmse_proxy = optimize_beam_ris(
-            H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota, f_init=f_beam,
+            H_BR, h_RUs_est, h_BUs=h_BUs, theta_init=theta_ota, f_init=f_beam,
             link_switch=link_switch, user_weights=K_norm.numpy(),
             update_vars=delta_var.numpy(),
             tx_power=config.ota_tx_power,
@@ -698,7 +762,7 @@ def main():
 
         if enable_cnn_arch_ablation:
             f_beam_arch, theta_ota_arch, nmse_proxy_arch = optimize_beam_ris(
-                H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota_arch, f_init=f_beam_arch,
+                H_BR, h_RUs_est_arch, h_BUs=h_BUs, theta_init=theta_ota_arch, f_init=f_beam_arch,
                 link_switch=link_switch, user_weights=K_norm.numpy(),
                 update_vars=delta_var_arch.numpy(),
                 tx_power=config.ota_tx_power,
@@ -714,7 +778,7 @@ def main():
 
         if enable_cnn_baseline:
             f_beam_baseline, theta_ota_baseline, nmse_proxy_baseline = optimize_beam_ris(
-                H_BR, h_RUs, h_BUs=h_BUs, theta_init=theta_ota_baseline, f_init=f_beam_baseline,
+                H_BR, h_RUs_est_baseline, h_BUs=h_BUs, theta_init=theta_ota_baseline, f_init=f_beam_baseline,
                 link_switch=link_switch, user_weights=K_norm.numpy(),
                 update_vars=delta_var_baseline.numpy(),
                 tx_power=config.ota_tx_power,
@@ -728,8 +792,9 @@ def main():
                 f"proxy_NMSE={nmse_proxy_baseline:.4e}"
             )
 
-        # Evolve channels for next round (AR(1) with optional dynamic alpha(t))
-        h_RUs, alpha_used = ru_evolver.step(h_RUs, round_idx)  # alpha_used: (K,)
+        # Advance channels to the precomputed next-round state.
+        h_RUs = h_RUs_next
+        alpha_used = alpha_used_next
         if config.use_dynamic_alpha:
             logger.info(f"RU dynamic alpha(t) (mode={config.dynamic_alpha_mode}): {alpha_used}, "
                         f"min={alpha_used.min():.4f}, max={alpha_used.max():.4f}"

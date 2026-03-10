@@ -1,6 +1,7 @@
 # utils/logger.py
 import datetime
 import os
+from utils.log_plotter import plot_round_metrics_from_log
 
 
 class Logger:
@@ -28,3 +29,12 @@ class Logger:
     def close(self):
         if self.log_file:
             self.log_file.close()
+        if self._path:
+            try:
+                fig_path = plot_round_metrics_from_log(self._path, figs_root="./figs")
+                if fig_path:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{timestamp}] Round metric figure saved: {fig_path}")
+            except Exception as exc:
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{timestamp}] Failed to plot round metrics: {exc}")
