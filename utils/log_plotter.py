@@ -12,8 +12,8 @@ GLOBAL_UPDATE_RE = re.compile(
 )
 AGG_NMSE_RE = re.compile(r"agg_NMSE=([0-9eE+.\-]+)")
 PROXY_NMSE_RE = re.compile(r"proxy_NMSE=([0-9eE+.\-]+)")
-MODEL_ORDER = ("GRU", "CNN-arch", "CNN-base")
-MODEL_COLORS = {"GRU": "#1f77b4", "CNN-arch": "#d627aa", "CNN-base": "#17becf"}
+MODEL_ORDER = ("GRU", "CNN-arch", "CNN-base", "Oracle-true")
+MODEL_COLORS = {"GRU": "#1f77b4", "CNN-arch": "#d627aa", "CNN-base": "#17becf", "Oracle-true": "#ff7f0e"}
 
 
 def _strip_ansi(text: str) -> str:
@@ -39,6 +39,8 @@ def _model_from_aircomp_line(msg: str) -> Optional[str]:
 
 
 def _model_from_proxy_line(msg: str) -> Optional[str]:
+    if "Optimized theta_ota (Oracle-true)" in msg:
+        return "Oracle-true"
     if "Optimized theta_ota (CNN-arch)" in msg:
         return "CNN-arch"
     if "Optimized theta_ota (CNN-base)" in msg:

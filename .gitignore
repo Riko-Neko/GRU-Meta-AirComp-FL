@@ -1,4 +1,6 @@
 *.npy
+*.png
+*.pdf
 log/
 .idea
 __pycache__

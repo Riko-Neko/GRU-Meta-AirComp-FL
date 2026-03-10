@@ -1,15 +1,24 @@
 from collections import deque
 import copy
+import os
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 from aircomp_opt.OTA_sim import AirCompSimulator
-from aircomp_opt.f_theta_optim import optimize_beam_ris
+from aircomp_opt.f_theta_optim import optimize_beam_ris, optimize_beam_ris_state_aware
 from data import deepmimo, pilot_gen
 from data.channel import build_ru_channel_evolver_from_config
 from fl_core.agg import MetaUpdater
 from fl_core.reptile_agg import ReptileAggregator
+from fl_core.state_metrics import (
+    build_state_weights,
+    combine_state_scores,
+    compute_head_distance,
+    compute_hidden_drift_ratio,
+    update_ewma_state,
+)
 from fl_core.model_vector import (
     state_dict_to_vector,
     state_dict_to_vector_backbone,
@@ -65,6 +74,158 @@ def _predict_h_ru_plain(model, x_seq, n_ris):
     return _ri_to_complex(pred.squeeze(0).cpu().numpy(), n_ris)
 
 
+def _flatten_head_state(head_state):
+    """Flatten one user's head state dict to a 1D numpy vector."""
+    parts = []
+    for key in sorted(head_state.keys()):
+        parts.append(head_state[key].detach().cpu().reshape(-1).float())
+    if not parts:
+        return np.zeros((0,), dtype=np.float32)
+    return torch.cat(parts, dim=0).numpy()
+
+
+def _project_rows_to_2d(x):
+    """Project row vectors to 2D using PCA (SVD-based)."""
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape={x.shape}")
+    n_samples = x.shape[0]
+    if n_samples == 0:
+        return np.zeros((0, 2), dtype=np.float64), 0.0, 0.0
+
+    centered = x - np.mean(x, axis=0, keepdims=True)
+    if centered.shape[1] == 0:
+        return np.zeros((n_samples, 2), dtype=np.float64), 0.0, 0.0
+
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    n_comp = min(2, vh.shape[0])
+    proj = centered @ vh[:n_comp, :].T
+    if n_comp < 2:
+        proj = np.pad(proj, ((0, 0), (0, 2 - n_comp)), mode="constant")
+
+    ratio1, ratio2 = 0.0, 0.0
+    if s.size > 0:
+        denom = float(max(1, centered.shape[0] - 1))
+        eigvals = (s ** 2) / denom
+        total = float(np.sum(eigvals))
+        if total > 0.0:
+            ratio1 = float(eigvals[0] / total)
+            if eigvals.size > 1:
+                ratio2 = float(eigvals[1] / total)
+    return proj, ratio1, ratio2
+
+
+def _save_head_projection_plot(user_head_states, round_idx, out_dir, tag):
+    """Save 2D projection plot for all users' head parameter states."""
+    if not user_head_states:
+        return None
+
+    vectors = [_flatten_head_state(hs) for hs in user_head_states]
+    mat = np.stack(vectors, axis=0).astype(np.float64, copy=False)
+    coords, ratio1, ratio2 = _project_rows_to_2d(mat)
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{tag}_head_proj_round_{round_idx:04d}.png")
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    user_ids = np.arange(1, coords.shape[0] + 1)
+    scatter = ax.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        c=user_ids,
+        cmap="tab20",
+        s=70,
+        edgecolors="black",
+        linewidths=0.4,
+    )
+    for i, (xv, yv) in enumerate(coords, start=1):
+        ax.text(float(xv), float(yv), f"U{i}", fontsize=8, ha="left", va="bottom")
+
+    ax.set_title(f"{tag} head projection @ round {round_idx}")
+    ax.set_xlabel(f"PC1 ({ratio1 * 100.0:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({ratio2 * 100.0:.1f}% var)")
+    ax.set_xlim(-5.0, 5.0)
+    ax.set_ylim(-5.0, 5.0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    fig.colorbar(scatter, ax=ax, label="User index")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
+def _save_gru_state_delta_plot(delta_vectors, round_idx, out_dir, tag="gru_state_delta"):
+    """
+    Save per-user GRU hidden-state delta debug figure.
+    Delta is expected as (current_hidden - previous_hidden), one vector per user.
+    """
+    if not delta_vectors:
+        return None
+
+    valid = [v for v in delta_vectors if v is not None]
+    if not valid:
+        return None
+
+    dim = int(valid[0].size)
+    num_users = len(delta_vectors)
+    mat = np.zeros((num_users, dim), dtype=np.float64)
+    has_prev = np.zeros((num_users,), dtype=np.bool_)
+    for i, vec in enumerate(delta_vectors):
+        if vec is None:
+            continue
+        arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+        if arr.size != dim:
+            # Keep debug robust even if shape changes unexpectedly.
+            dmin = min(dim, arr.size)
+            mat[i, :dmin] = arr[:dmin]
+        else:
+            mat[i, :] = arr
+        has_prev[i] = True
+
+    norms = np.linalg.norm(mat, axis=1)
+    coords, ratio1, ratio2 = _project_rows_to_2d(mat)
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{tag}_round_{round_idx:04d}.png")
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    ax_bar, ax_scatter = axes
+    user_ids = np.arange(1, num_users + 1)
+
+    bar_colors = ["tab:blue" if has_prev[i - 1] else "tab:gray" for i in user_ids]
+    ax_bar.bar(user_ids, norms, color=bar_colors, edgecolor="black", linewidth=0.4)
+    ax_bar.set_title(f"{tag} norm @ round {round_idx}")
+    ax_bar.set_xlabel("User")
+    ax_bar.set_ylabel("||delta_h||2")
+    ax_bar.grid(True, alpha=0.25, axis="y")
+
+    scatter = ax_scatter.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        c=user_ids,
+        cmap="tab20",
+        s=70,
+        edgecolors="black",
+        linewidths=0.4,
+    )
+    for i, (xv, yv) in enumerate(coords, start=1):
+        suffix = "" if has_prev[i - 1] else "*"
+        ax_scatter.text(float(xv), float(yv), f"U{i}{suffix}", fontsize=8, ha="left", va="bottom")
+
+    ax_scatter.set_title(f"{tag} PCA @ round {round_idx}")
+    ax_scatter.set_xlabel(f"PC1 ({ratio1 * 100.0:.1f}% var)")
+    ax_scatter.set_ylabel(f"PC2 ({ratio2 * 100.0:.1f}% var)")
+    ax_scatter.set_xlim(-5.0, 5.0)
+    ax_scatter.set_ylim(-5.0, 5.0)
+    ax_scatter.set_aspect("equal", adjustable="box")
+    ax_scatter.grid(True, alpha=0.25)
+    fig.colorbar(scatter, ax=ax_scatter, label="User index")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
+
 def main():
     config = Config
     logger = Logger(config=config) if config.log_to_file else Logger()
@@ -72,6 +233,40 @@ def main():
     logger.info("Initializing simulation...")
     np.random.seed(0)
     torch.manual_seed(0)
+
+    debug_head_plot_enabled = bool(getattr(config, "enable_reptile_head_debug_plot", False))
+    debug_head_plot_every = int(getattr(config, "reptile_head_debug_every", 10))
+    if debug_head_plot_every <= 0:
+        debug_head_plot_every = 10
+    debug_head_plot_root = str(getattr(config, "reptile_head_debug_root", "debug"))
+    debug_gru_state_plot_enabled = bool(getattr(config, "enable_gru_state_diff_debug_plot", False))
+    debug_gru_state_plot_every = int(getattr(config, "gru_state_diff_debug_every", 10))
+    if debug_gru_state_plot_every <= 0:
+        debug_gru_state_plot_every = 10
+    debug_head_plot_run_dir = None
+    debug_head_plot_gru_dir = None
+    debug_head_plot_arch_dir = None
+    debug_gru_state_plot_dir = None
+    if (debug_head_plot_enabled or debug_gru_state_plot_enabled) and str(config.meta_algorithm).lower() == "reptile":
+        debug_head_plot_run_dir = os.path.join(debug_head_plot_root, config.fingerprint())
+        debug_head_plot_gru_dir = os.path.join(debug_head_plot_run_dir, "head_projection_gru")
+        debug_head_plot_arch_dir = os.path.join(debug_head_plot_run_dir, "head_projection_cnn_arch")
+        debug_gru_state_plot_dir = os.path.join(debug_head_plot_run_dir, "gru_state_delta")
+        if debug_head_plot_enabled:
+            os.makedirs(debug_head_plot_gru_dir, exist_ok=True)
+            os.makedirs(debug_head_plot_arch_dir, exist_ok=True)
+            logger.info(
+                f"Reptile head debug projection enabled: every {debug_head_plot_every} rounds, "
+                f"out={debug_head_plot_run_dir}"
+            )
+        if debug_gru_state_plot_enabled:
+            os.makedirs(debug_gru_state_plot_dir, exist_ok=True)
+            logger.info(
+                f"GRU state-diff debug enabled: every {debug_gru_state_plot_every} rounds, "
+                f"out={debug_gru_state_plot_dir}"
+            )
+    elif debug_head_plot_enabled or debug_gru_state_plot_enabled:
+        logger.info("Reptile debug plotting skipped: meta_algorithm is not Reptile.")
 
     link_switch = config.link_switch
     reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
@@ -173,6 +368,33 @@ def main():
         raise ValueError("Config.gru_context_mode must be 'persistent_hidden' or 'time_window'")
     use_persistent_hidden_state = (gru_context_mode == "persistent_hidden")
     use_time_window = (gru_context_mode == "time_window")
+    oa_optimizer_mode = str(getattr(config, "oa_optimizer_mode", "legacy")).strip().lower()
+    if oa_optimizer_mode not in {"legacy", "state_aware"}:
+        raise ValueError("Config.oa_optimizer_mode must be 'legacy' or 'state_aware'")
+    if oa_optimizer_mode == "state_aware" and not use_persistent_hidden_state:
+        raise ValueError("State-aware OA currently supports only gru_context_mode='persistent_hidden'")
+
+    state_beta_z = float(getattr(config, "state_beta_z", 0.1))
+    state_alpha_z = float(getattr(config, "state_alpha_z", 0.5))
+    state_alpha_x = float(getattr(config, "state_alpha_x", 0.5))
+    state_mu = float(getattr(config, "state_mu", 0.5))
+    state_weight_min = float(getattr(config, "state_weight_min", 0.5))
+    state_weight_max = float(getattr(config, "state_weight_max", 2.0))
+    state_fast_clip = float(getattr(config, "state_fast_clip", 2.0))
+    state_eps = float(getattr(config, "state_eps", 1e-8))
+    state_strategy = str(getattr(config, "state_strategy", "protect")).strip().lower()
+    if state_strategy not in {"protect", "stability"}:
+        raise ValueError("Config.state_strategy must be 'protect' or 'stability'")
+    alpha_sum = state_alpha_z + state_alpha_x
+    if alpha_sum <= 0:
+        raise ValueError("state_alpha_z + state_alpha_x must be positive")
+    state_alpha_z = state_alpha_z / alpha_sum
+    state_alpha_x = state_alpha_x / alpha_sum
+    oa_ao_iters = int(getattr(config, "oa_ao_iters", 2))
+    oa_theta_lr = float(getattr(config, "oa_theta_lr", 0.05))
+    oa_theta_grad_steps = int(getattr(config, "oa_theta_grad_steps", 1))
+    oa_normalize_f = bool(getattr(config, "oa_normalize_f", True))
+
     reset_hidden_on_round1 = bool(config.reset_hidden_on_round1)
     reset_hidden_on_large_backbone_update = bool(config.reset_hidden_on_large_backbone_update)
     hidden_reset_update_norm_threshold = float(config.hidden_reset_update_norm_threshold)
@@ -181,6 +403,7 @@ def main():
     logger.info(
         f"GRU context mode={gru_context_mode}, W={W}"
     )
+    logger.info(f"OA optimizer mode={oa_optimizer_mode}")
     logger.info(f"GRU CSI target mode={gru_csi_target_mode}")
     logger.info("CNN-arch/CNN-base CSI target mode=t")
     # Per-user local sample cache for GRU/CNN-arch only.
@@ -197,6 +420,18 @@ def main():
     # For warm-start heads: keep a global head template to clone for users
     global_head_state = {k: v.clone() for k, v in global_model.state_dict().items() if k.startswith("head")}
     user_head_states = [copy.deepcopy(global_head_state) for _ in range(config.num_users)]
+    state_slow_z = np.zeros((config.num_users,), dtype=np.float32)
+    state_fast_x = np.zeros((config.num_users,), dtype=np.float32)
+    state_eta = np.ones((config.num_users,), dtype=np.float32)
+    state_omega = np.ones((config.num_users,), dtype=np.float32)
+    if oa_optimizer_mode == "state_aware":
+        logger.info(
+            "State-aware OA params: "
+            f"beta_z={state_beta_z:.3f}, alpha_z={state_alpha_z:.3f}, alpha_x={state_alpha_x:.3f}, "
+            f"mu={state_mu:.3f}, clip=[{state_weight_min:.3f},{state_weight_max:.3f}], "
+            f"x_clip={state_fast_clip:.3f}, strategy={state_strategy}"
+        )
+        logger.info("State-aware slow state uses fixed global head template distance.")
 
     enable_cnn_arch_ablation = bool(config.enable_cnn_arch_ablation)
     global_model_arch = None
@@ -267,6 +502,11 @@ def main():
             "(single-step input, full-model FedAvg, non-stateful)."
         )
         logger.info("Literature CNN baseline local cache is disabled by design.")
+
+    # Oracle upper-bound reference branch (true CSI driven AO only, no model training).
+    f_beam_oracle = f_beam.copy()
+    theta_ota_oracle = theta_ota.copy()
+    logger.info("Oracle-true AO reference enabled=True (upper bound, true CSI driven).")
 
     # OTA simulator (Phase1 physical aggregation)
     aircomp_sim = None
@@ -416,6 +656,10 @@ def main():
             if enable_cnn_arch_ablation else None
         h_RUs_est_baseline = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64) \
             if enable_cnn_baseline else None
+        state_fast_x_round = np.zeros((config.num_users,), dtype=np.float32)
+        # Debug-only cache: per-user hidden-state delta (current - history), no training-path impact.
+        gru_state_delta_vectors = [None for _ in range(config.num_users)] \
+            if (debug_gru_state_plot_dir is not None and use_persistent_hidden_state) else None
         for k in range(config.num_users):
             loss_arch = None
             loss_baseline = None
@@ -438,6 +682,19 @@ def main():
                     hidden_state=hidden_prev,
                 )
                 user_hidden_states[k] = hidden_next
+                state_fast_x_round[k] = compute_hidden_drift_ratio(
+                    hidden_prev=hidden_prev,
+                    hidden_next=hidden_next,
+                    eps=state_eps,
+                    x_max=state_fast_clip,
+                )
+                if gru_state_delta_vectors is not None and hidden_next is not None:
+                    vec_next = hidden_next.detach().cpu().reshape(-1).float()
+                    if hidden_prev is None:
+                        vec_prev = torch.zeros_like(vec_next)
+                    else:
+                        vec_prev = hidden_prev.detach().cpu().reshape(-1).float()
+                    gru_state_delta_vectors[k] = (vec_next - vec_prev).numpy()
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
                 h_RUs_est[k] = _predict_h_ru_gru(
@@ -461,7 +718,24 @@ def main():
             losses.append(loss if loss is not None else 0.0)
             local_models.append(local_model)
             # cache back the personalized head for user k
-            user_head_states[k] = {name: param.detach().clone() for name, param in local_model.state_dict().items() if name.startswith("head")}
+            user_head_states[k] = {
+                name: param.detach().clone()
+                for name, param in local_model.state_dict().items()
+                if name.startswith("head")
+            }
+            head_dist_k = compute_head_distance(
+                head_state_user=user_head_states[k],
+                head_state_global=global_head_state,
+                eps=state_eps,
+            )
+            if round_idx == 1:
+                state_slow_z[k] = head_dist_k
+            else:
+                state_slow_z[k] = update_ewma_state(
+                    prev_value=state_slow_z[k],
+                    current_value=head_dist_k,
+                    beta=state_beta_z,
+                )
 
             if enable_cnn_arch_ablation:
                 local_model_arch = CSICNNArch(
@@ -532,6 +806,62 @@ def main():
             if enable_cnn_baseline and losses_baseline:
                 round_loss_parts.append(f"CNN-base: {np.mean(losses_baseline):.4f}")
             logger.info(", ".join(round_loss_parts))
+
+        state_fast_x = state_fast_x_round.astype(np.float32, copy=False)
+        if oa_optimizer_mode == "state_aware":
+            state_eta, z_bar, x_bar = combine_state_scores(
+                z_state=state_slow_z,
+                x_state=state_fast_x,
+                alpha_z=state_alpha_z,
+                alpha_x=state_alpha_x,
+                eps=state_eps,
+            )
+            state_omega, _ = build_state_weights(
+                eta_state=state_eta,
+                mu=state_mu,
+                weight_min=state_weight_min,
+                weight_max=state_weight_max,
+                strategy=state_strategy,
+            )
+            logger.info(
+                "State metrics: "
+                f"z_bar={z_bar:.4e}, x_bar={x_bar:.4e}, "
+                f"eta[min/mean/max]={np.min(state_eta):.3f}/{np.mean(state_eta):.3f}/{np.max(state_eta):.3f}, "
+                f"omega[min/mean/max]={np.min(state_omega):.3f}/{np.mean(state_omega):.3f}/{np.max(state_omega):.3f}"
+            )
+        else:
+            state_eta = np.ones((config.num_users,), dtype=np.float32)
+            state_omega = np.ones((config.num_users,), dtype=np.float32)
+
+        if debug_head_plot_gru_dir is not None and (round_idx % debug_head_plot_every == 0):
+            proj_path_gru = _save_head_projection_plot(
+                user_head_states=user_head_states,
+                round_idx=round_idx,
+                out_dir=debug_head_plot_gru_dir,
+                tag="gru",
+            )
+            if proj_path_gru is not None:
+                logger.info(f"[DEBUG] Saved GRU head projection: {proj_path_gru}")
+            if enable_cnn_arch_ablation and user_head_states_arch is not None:
+                proj_path_arch = _save_head_projection_plot(
+                    user_head_states=user_head_states_arch,
+                    round_idx=round_idx,
+                    out_dir=debug_head_plot_arch_dir,
+                    tag="cnn_arch",
+                )
+                if proj_path_arch is not None:
+                    logger.info(f"[DEBUG] Saved CNN-arch head projection: {proj_path_arch}")
+        if (debug_gru_state_plot_dir is not None
+                and gru_state_delta_vectors is not None
+                and (round_idx % debug_gru_state_plot_every == 0)):
+            state_diff_path = _save_gru_state_delta_plot(
+                delta_vectors=gru_state_delta_vectors,
+                round_idx=round_idx,
+                out_dir=debug_gru_state_plot_dir,
+                tag="gru_state_delta",
+            )
+            if state_diff_path is not None:
+                logger.info(f"[DEBUG] Saved GRU state-diff plot: {state_diff_path}")
 
         # Aggregate updates at server
         logger.info("Aggregating GRU updates at server.")
@@ -746,15 +1076,41 @@ def main():
         # Optimize beamforming vector f and RIS phases theta for next round
         logger.info("Optimizing beamforming and RIS configuration.")
         # Use model-estimated h_RU for OTA beam/RIS optimization.
-        f_beam, theta_ota, nmse_proxy = optimize_beam_ris(
-            H_BR, h_RUs_est, h_BUs=h_BUs, theta_init=theta_ota, f_init=f_beam,
-            link_switch=link_switch, user_weights=K_norm.numpy(),
-            update_vars=delta_var.numpy(),
-            tx_power=config.ota_tx_power,
-            noise_std=config.ota_noise_std,
-            var_floor=config.ota_var_floor,
-            eps=config.ota_eps,
-        )
+        if oa_optimizer_mode == "state_aware":
+            f_beam, theta_ota, nmse_proxy = optimize_beam_ris_state_aware(
+                H_BR,
+                h_RUs_est,
+                h_BUs=h_BUs,
+                theta_init=theta_ota,
+                f_init=f_beam,
+                link_switch=link_switch,
+                user_weights=K_norm.numpy(),
+                state_weights=state_omega,
+                update_vars=delta_var.numpy(),
+                tx_power=config.ota_tx_power,
+                noise_std=config.ota_noise_std,
+                var_floor=config.ota_var_floor,
+                ao_iters=oa_ao_iters,
+                theta_lr=oa_theta_lr,
+                theta_grad_steps=oa_theta_grad_steps,
+                normalize_f=oa_normalize_f,
+                eps=config.ota_eps,
+            )
+        else:
+            f_beam, theta_ota, nmse_proxy = optimize_beam_ris(
+                H_BR,
+                h_RUs_est,
+                h_BUs=h_BUs,
+                theta_init=theta_ota,
+                f_init=f_beam,
+                link_switch=link_switch,
+                user_weights=K_norm.numpy(),
+                update_vars=delta_var.numpy(),
+                tx_power=config.ota_tx_power,
+                noise_std=config.ota_noise_std,
+                var_floor=config.ota_var_floor,
+                eps=config.ota_eps,
+            )
         # New pilot pattern independent from OTA theta
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
         logger.info(f"Optimized f: {np.round(f_beam, 4)}")
@@ -791,6 +1147,23 @@ def main():
                 f"Optimized theta_ota (CNN-base): {np.round(theta_ota_baseline, 4)}, "
                 f"proxy_NMSE={nmse_proxy_baseline:.4e}"
             )
+
+        # Oracle upper-bound AO reference with true channels.
+        h_RUs_true_for_oracle = h_RUs_target_gru
+        f_beam_oracle, theta_ota_oracle, nmse_proxy_oracle = optimize_beam_ris(
+            H_BR, h_RUs_true_for_oracle, h_BUs=h_BUs, theta_init=theta_ota_oracle, f_init=f_beam_oracle,
+            link_switch=link_switch, user_weights=K_norm.numpy(),
+            update_vars=delta_var.numpy(),
+            tx_power=config.ota_tx_power,
+            noise_std=config.ota_noise_std,
+            var_floor=config.ota_var_floor,
+            eps=config.ota_eps,
+        )
+        logger.info(f"Optimized f (Oracle-true): {np.round(f_beam_oracle, 4)}")
+        logger.info(
+            f"Optimized theta_ota (Oracle-true): {np.round(theta_ota_oracle, 4)}, "
+            f"proxy_NMSE={nmse_proxy_oracle:.4e}"
+        )
 
         # Advance channels to the precomputed next-round state.
         h_RUs = h_RUs_next

@@ -27,9 +27,9 @@ class Config:
     link_switch = [1, 0]
 
     # channel settings (RIS->UE link, RU)
-    channel_alpha = 0.9  # AR(1)
+    channel_alpha = 0.6  # AR(1)
     use_dynamic_alpha = False
-    dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
+    dynamic_alpha_mode = "piecewise"  # "sinusoid" | "piecewise"
     alpha_min = 0.50
     alpha_max = 0.98
     alpha_period_rounds = 20
@@ -41,17 +41,14 @@ class Config:
     alpha_user_min = 0.60
     alpha_user_max = 0.98
     # Pilot observation noise
-    use_user_pilot_snr_hetero = False
+    use_user_pilot_snr_hetero = True
     pilot_SNR_dB = 20
     pilot_snr_dB_min = 10
     pilot_snr_dB_max = 30
 
     # GRU context settings
     gru_context_mode = "persistent_hidden" # "persistent_hidden" | "time_window"
-    # CSI supervision target for GRU:
-    # "t"   -> estimate current h_RU(t)
-    # "t+1" -> one-step prediction h_RU(t+1) from current pilots
-    gru_csi_target_mode = "t+1"
+    gru_csi_target_mode = "t+1" # CSI supervision target for GRU: "t" | "t+1"
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
     reset_hidden_on_round1 = True
@@ -65,7 +62,7 @@ class Config:
     cnn_baseline_hidden_size = 32
 
     # Pure architecture ablation (replace GRU backbone with non-stateful CNN)
-    enable_cnn_arch_ablation = True
+    enable_cnn_arch_ablation = False
     cnn_arch_conv_filters = 8
     cnn_arch_conv_kernel = 3
     cnn_arch_hidden_size = 32
@@ -76,16 +73,16 @@ class Config:
     local_cache_size = 8  # S sample cached per-user
 
     # Federated learning settings
-    num_rounds = 100  # number of communication rounds
-    local_epochs = 3  # local update epochs per round (per user)
+    num_rounds = 300  # number of communication rounds
+    local_epochs = 5  # local update epochs per round (per user)
     local_lr = 1e-3  # learning rate for local training
     batch_size = 32  # batch size for local training (None means use all data per epoch)
     meta_algorithm = "Reptile"  # Meta-FL algorithm ("Reptile" or "FedAvg")
-    reptile_step_size = 0.1  # step size (beta) for Reptile algorithm (if applicable)
+    reptile_step_size = 0.5  # step size (beta) for Reptile algorithm (if applicable)
 
     # AirComp and communication settings
     use_aircomp = True  # whether to simulate AirComp aggregation with noise
-    SNR_dB = 0  # SNR in dB for AirComp (if use_aircomp is True)
+    SNR_dB = 20  # SNR in dB for AirComp (if use_aircomp is True)
     noise_std = math.pow(10, - (SNR_dB / 20.0))  # noise standard deviation from SNR_dB (20 dB -> ~0.1)
     # OTA aggregation settings (Phase1)
     ota_tx_power = 0.1
@@ -98,15 +95,48 @@ class Config:
     user_data_size_min = 5000
     user_data_size_max = 20000
 
+    # OA optimizer mode
+    oa_optimizer_mode = "state_aware"  # "legacy" | "state_aware"
+    oa_ao_iters = 2
+    oa_theta_lr = 0.05
+    oa_theta_grad_steps = 1
+    oa_normalize_f = True
+
+    # State-aware OA settings
+    state_beta_z = 0.1
+    state_alpha_z = 0.5
+    state_alpha_x = 0.5
+    state_mu = 0.5
+    state_weight_min = 0.5
+    state_weight_max = 2.0
+    state_fast_clip = 2.0
+    state_eps = 1e-8
+    state_strategy = "protect"  # "protect" | "stability"
+
     # Logging settings
     log_to_file = True  # whether to save logs to a file
     log_file_path = "demo.log"  # log file path if enabled
+
+    # Debug visualization: per-user Reptile head parameter projection
+    enable_reptile_head_debug_plot = True
+    reptile_head_debug_every = 10  # save one projection figure every N rounds
+    reptile_head_debug_root = "debug"
+    enable_gru_state_diff_debug_plot = True
+    gru_state_diff_debug_every = 10  # save one GRU state-diff figure every N rounds
 
     @classmethod
     def as_dict(cls):
         d = {}
         for k, v in vars(cls).items():
             if k.startswith("_"):
+                continue
+            if k in {
+                "enable_reptile_head_debug_plot",
+                "reptile_head_debug_every",
+                "reptile_head_debug_root",
+                "enable_gru_state_diff_debug_plot",
+                "gru_state_diff_debug_every",
+            }:
                 continue
             if callable(v):
                 continue
