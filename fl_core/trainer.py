@@ -102,3 +102,43 @@ class GRUTrainer:
             _, hidden_next = model(X_tensor, h0=h_prev, return_hidden=True)
         model.train()
         return model, final_loss, hidden_next.detach().cpu()
+
+    def train_stateful_sequence(self, model, samples, hidden_state=None):
+        """
+        Stateful sequential local update on continuous segments.
+        samples: list of (X, y), each X has shape (1, 2, obs_dim) or (seq_len, 2, obs_dim).
+        hidden_state: previous local hidden state (num_layers, 1, hidden_size), CPU tensor or None.
+        Returns: (model, final_loss, hidden_next_cpu_detached, last_pred_cpu_tensor)
+        """
+        if not samples:
+            raise ValueError("samples must be non-empty for train_stateful_sequence")
+
+        model.to(self.device)
+        model.train()
+        optimizer = optim.Adam(model.parameters(), lr=self.learning_rate)
+
+        h_prev = None
+        if hidden_state is not None:
+            h_prev = hidden_state.detach().to(self.device)
+
+        final_loss = None
+        last_pred = None
+        for _ in range(self.epochs):
+            for X, y in samples:
+                X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
+                y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).unsqueeze(0)
+                optimizer.zero_grad()
+                outputs, h_next = model(X_tensor, h0=h_prev, return_hidden=True)
+                loss = self.criterion(outputs, y_tensor)
+                loss.backward()
+                optimizer.step()
+                final_loss = loss.item()
+                # Keep hidden state continuity while truncating gradient history between segments.
+                h_prev = h_next.detach()
+                last_pred = outputs.detach().cpu().squeeze(0).float()
+
+        if h_prev is None:
+            hidden_next_cpu = None
+        else:
+            hidden_next_cpu = h_prev.detach().cpu()
+        return model, final_loss, hidden_next_cpu, last_pred

@@ -105,7 +105,13 @@ All knobs live in `utils/config.py`. Key options:
 - `use_user_pilot_snr_hetero`, `pilot_snr_dB_min`, `pilot_snr_dB_max`
 - `use_user_alpha_hetero`, `alpha_user_min`, `alpha_user_max`
 - `use_dynamic_alpha`, `dynamic_alpha_mode`, `alpha_min`, `alpha_max`, `alpha_period_rounds`, `alpha_piecewise`
+- `ota_use_weighted_users`, `user_data_partition_mode`, `user_data_size_equal`, `user_group_ratios`, `user_group_data_sizes`
 - `link_switch` `[reflect, direct]`: `[1,0]` reflection only, `[0,1]` direct only (no RIS), `[1,1]` both, `[0,0]` invalid
+
+OTA user weights:
+- If `ota_use_weighted_users=True`, `n_k` is computed each round from the actual number of local samples used by user `k` in local training.
+- If `ota_use_weighted_users=False`, all users use equal weight.
+- In `gru_context_mode="persistent_hidden"`, per-user local sample counts are driven by `user_data_partition_mode`, `user_data_size_equal`, and `user_group_data_sizes` (continuous segments, state retained).
 
 Personalized split behavior (now default in code):
 - `Backbone` parameters are the only part used to compute OTA/Fed updates.

@@ -12,7 +12,19 @@ class MetaUpdater:
         self.use_aircomp = use_aircomp
         self.aircomp = aircomp_simulator
     
-    def aggregate(self, global_model, local_models, H_BR=None, h_RUs=None, f=None, theta=None, *, backbone_only=False, prefix="backbone"):
+    def aggregate(
+        self,
+        global_model,
+        local_models,
+        H_BR=None,
+        h_RUs=None,
+        f=None,
+        theta=None,
+        *,
+        backbone_only=False,
+        prefix="backbone",
+        client_weights=None,
+    ):
         """
         Aggregate local model parameters into the global model.
         Optionally simulate AirComp communication error if use_aircomp is True.
@@ -23,24 +35,35 @@ class MetaUpdater:
         # Get state dicts of local models
         state_dicts = [lm.state_dict() for lm in local_models]
         K = len(state_dicts)
+        if client_weights is None:
+            weight_vec = torch.ones((K,), dtype=torch.float32)
+        else:
+            weight_vec = torch.as_tensor(client_weights, dtype=torch.float32).reshape(-1)
+            if weight_vec.numel() != K:
+                raise ValueError(f"client_weights size mismatch: expected {K}, got {weight_vec.numel()}")
+            weight_vec = torch.clamp(weight_vec, min=0.0)
+        weight_sum = float(torch.sum(weight_vec).item())
+        if weight_sum <= 0.0:
+            raise ValueError("client_weights must have positive sum")
         # Initialize aggregated state as zeros
         base_state = global_model.state_dict()
         agg_state = {key: torch.zeros_like(val) for key, val in base_state.items()}
         # Sum all local parameters (optionally backbone only)
-        for state in state_dicts:
+        for idx, state in enumerate(state_dicts):
+            coeff = float(weight_vec[idx].item())
             for key, val in state.items():
                 if backbone_only and not key.startswith(prefix):
                     continue
-                agg_state[key] += val.cpu()  # ensure on CPU for aggregation
+                agg_state[key] += coeff * val.cpu()  # ensure on CPU for aggregation
         # Simulate AirComp noise if enabled
         if self.use_aircomp and self.aircomp is not None:
             agg_state = self.aircomp.aggregate(agg_state, K)
         else:
-            # Just average directly
+            # Average directly; weighted FedAvg if client_weights is provided.
             for key in agg_state:
                 if backbone_only and not key.startswith(prefix):
                     continue
-                agg_state[key] /= K
+                agg_state[key] /= weight_sum
         # If using a meta-learning update (Reptile) with step_size < 1
         if self.meta_algorithm.lower() == "reptile" and self.step_size < 1.0:
             new_state = copy.deepcopy(base_state)

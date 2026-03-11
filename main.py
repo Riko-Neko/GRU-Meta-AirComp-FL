@@ -1,5 +1,6 @@
 from collections import deque
 import copy
+import math
 import os
 
 import matplotlib.pyplot as plt
@@ -40,6 +41,104 @@ def _parse_gru_target_mode(mode):
     if token in {"t+1", "t_plus_1", "next", "t1"}:
         return "t+1"
     raise ValueError("Config.gru_csi_target_mode must be 't' or 't+1'")
+
+
+def _allocate_counts_by_ratio(total_count, ratios):
+    """Allocate integer counts by ratio with largest-remainder rounding."""
+    total_count = int(total_count)
+    if total_count <= 0:
+        raise ValueError(f"total_count must be positive, got {total_count}")
+    ratios = np.asarray(ratios, dtype=np.float64).reshape(-1)
+    if ratios.size == 0:
+        raise ValueError("ratios must be non-empty")
+    if np.any(ratios < 0):
+        raise ValueError("ratios must be non-negative")
+    ratio_sum = float(np.sum(ratios))
+    if ratio_sum <= 0.0:
+        raise ValueError("sum(ratios) must be positive")
+    ratios = ratios / ratio_sum
+
+    raw = ratios * float(total_count)
+    counts = np.floor(raw).astype(np.int64)
+    remainder = total_count - int(np.sum(counts))
+    if remainder > 0:
+        frac = raw - counts.astype(np.float64)
+        order = np.argsort(-frac)
+        for idx in range(remainder):
+            counts[order[idx % order.size]] += 1
+    return counts
+
+
+def _build_user_data_partitions(config):
+    """
+    Build a per-user virtual data partition and derive n_k from partition lengths.
+    Returns:
+      n_k: np.ndarray [K], float32
+      mode: "equal" or "grouped"
+      group_counts: np.ndarray [3], int64, counts for small/medium/large groups
+    """
+    k_users = int(config.num_users)
+    if k_users <= 0:
+        raise ValueError(f"Config.num_users must be positive, got {k_users}")
+
+    mode = str(getattr(config, "user_data_partition_mode", "equal")).strip().lower()
+    if mode == "equal":
+        n_equal = int(getattr(config, "user_data_size_equal", 1))
+        if n_equal <= 0:
+            raise ValueError(f"Config.user_data_size_equal must be positive, got {n_equal}")
+        user_sizes = np.full((k_users,), n_equal, dtype=np.int64)
+        group_counts = np.array([k_users, 0, 0], dtype=np.int64)
+    elif mode == "grouped":
+        group_sizes = np.asarray(getattr(config, "user_group_data_sizes", [1, 1, 1]), dtype=np.int64).reshape(-1)
+        group_ratios = np.asarray(getattr(config, "user_group_ratios", [1.0, 1.0, 1.0]), dtype=np.float64).reshape(-1)
+        if group_sizes.size != 3:
+            raise ValueError(
+                f"Config.user_group_data_sizes must contain 3 values [small, medium, large], got {group_sizes.size}"
+            )
+        if group_ratios.size != 3:
+            raise ValueError(
+                f"Config.user_group_ratios must contain 3 values [small, medium, large], got {group_ratios.size}"
+            )
+        if np.any(group_sizes <= 0):
+            raise ValueError(f"Config.user_group_data_sizes must be positive, got {group_sizes.tolist()}")
+        group_counts = _allocate_counts_by_ratio(k_users, group_ratios)
+
+        user_sizes = np.empty((k_users,), dtype=np.int64)
+        start = 0
+        for group_idx in range(3):
+            end = start + int(group_counts[group_idx])
+            user_sizes[start:end] = int(group_sizes[group_idx])
+            start = end
+    else:
+        raise ValueError("Config.user_data_partition_mode must be 'equal' or 'grouped'")
+
+    # Build virtual partition ranges and derive n_k from exact partition lengths.
+    partition_ranges = []
+    cursor = 0
+    for user_idx in range(k_users):
+        n_user = int(user_sizes[user_idx])
+        start = cursor
+        end = start + n_user
+        partition_ranges.append((start, end))
+        cursor = end
+    n_k = np.asarray([float(end - start) for (start, end) in partition_ranges], dtype=np.float32)
+    return n_k, mode, group_counts
+
+
+def _evolve_ru_single(ru_evolver, h_ru_vec, user_idx, time_idx):
+    """
+    Evolve one user's RU channel by one AR(1) step.
+    """
+    alpha_global = ru_evolver.traj.get_alpha(time_idx)
+    if ru_evolver.alpha_bases is None:
+        alpha = float(alpha_global)
+    else:
+        delta = float(alpha_global - ru_evolver.base_static_alpha)
+        alpha = float(ru_evolver.traj._clip_alpha(ru_evolver.alpha_bases[user_idx] + delta))
+    beta = math.sqrt(max(0.0, 1.0 - alpha * alpha))
+    noise = (np.random.randn(*h_ru_vec.shape) + 1j * np.random.randn(*h_ru_vec.shape)) / math.sqrt(2.0)
+    h_next = alpha * h_ru_vec + beta * noise.astype(h_ru_vec.dtype, copy=False)
+    return h_next.astype(h_ru_vec.dtype, copy=False), alpha
 
 
 def _complex_to_ri(vec_complex):
@@ -413,9 +512,10 @@ def main():
     sample_buffers = [deque(maxlen=S) for _ in range(config.num_users)]
     logger.info(f"Local sample cache (GRU/CNN-arch) enabled={use_local_cache_seq_models}, S={S}")
     if use_persistent_hidden_state and use_local_cache_seq_models:
-        logger.info("Persistent-hidden GRU path bypasses local sample cache (single-step online update).")
+        logger.info("Persistent-hidden GRU path bypasses local sample cache (continuous-segment update).")
     global_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
     user_hidden_states = [None for _ in range(config.num_users)]
+    user_segment_time = np.zeros((config.num_users,), dtype=np.int64)
     reset_hidden_next_round = False
     # For warm-start heads: keep a global head template to clone for users
     global_head_state = {k: v.clone() for k, v in global_model.state_dict().items() if k.startswith("head")}
@@ -424,6 +524,20 @@ def main():
     state_fast_x = np.zeros((config.num_users,), dtype=np.float32)
     state_eta = np.ones((config.num_users,), dtype=np.float32)
     state_omega = np.ones((config.num_users,), dtype=np.float32)
+    user_n_k_target, user_partition_mode, user_group_counts = _build_user_data_partitions(config)
+    logger.info(
+        f"User data partition mode={user_partition_mode}, "
+        f"target_n_k(min/mean/max)=("
+        f"{float(user_n_k_target.min()):.1f}/{float(user_n_k_target.mean()):.1f}/{float(user_n_k_target.max()):.1f})"
+    )
+    if user_partition_mode == "grouped":
+        logger.info(
+            "Grouped user partition "
+            f"(small/medium/large): counts={user_group_counts.tolist()}, "
+            f"n_k={list(np.asarray(config.user_group_data_sizes, dtype=int).tolist())}"
+        )
+    if not bool(config.ota_use_weighted_users):
+        logger.info("OTA user weighting disabled: using equal weights (all ones).")
     if oa_optimizer_mode == "state_aware":
         logger.info(
             "State-aware OA params: "
@@ -536,34 +650,101 @@ def main():
                 reason = "round1" if (round_idx == 1 and reset_hidden_on_round1) else "large_backbone_update"
                 logger.info(f"Reset persistent hidden states at round {round_idx} (reason={reason}).")
                 reset_hidden_next_round = False
-        # Precompute one-step channel evolution once for this round so supervision and
-        # the actual next-round channel transition stay consistent.
-        h_RUs_next, alpha_used_next = ru_evolver.step(h_RUs, round_idx)
-        h_RUs_target_gru = h_RUs_next if gru_csi_target_mode == "t+1" else h_RUs
+        if use_persistent_hidden_state:
+            # Persistent mode uses variable-length continuous segments per user.
+            h_RUs_next = np.zeros_like(h_RUs)
+            alpha_used_next = np.zeros((config.num_users,), dtype=np.float32)
+            h_RUs_target_gru = None
+        else:
+            # One-step channel evolution for non-persistent mode.
+            h_RUs_next, alpha_used_next = ru_evolver.step(h_RUs, round_idx)
+            h_RUs_target_gru = h_RUs_next if gru_csi_target_mode == "t+1" else h_RUs
 
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
+        local_data_stateful = [[] for _ in range(config.num_users)] if use_persistent_hidden_state else None
         local_data_arch = [] if enable_cnn_arch_ablation else None
-        local_data_baseline = [] if enable_cnn_baseline else None
+        local_data_baseline = [None for _ in range(config.num_users)] if enable_cnn_baseline else None
         for k in range(config.num_users):
             # Pilot signals for user k
             h_BU_k = h_BUs[k] if h_BUs is not None else None
-            Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
-                H_BR, h_RUs[k], f_beam, theta_pilot,
-                noise_std=float(pilot_noise_std_k[k]),
-                h_BU=h_BU_k,
-                link_switch=link_switch,
-            )
-
-            # Build GRU sequence input: X_seq shape (W, 2, P) --> (seq_len, 2, obs_dim)
-
-            obs_real = np.real(Y_pilot)  # Separate real and imag channels
-            obs_imag = np.imag(Y_pilot)
-            obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
-
             if use_persistent_hidden_state:
-                X_seq = obs_step[None, :, :]  # (1, 2, P), one newly received step only
+                seg_count = max(1, int(round(float(user_n_k_target[k]))))
+                h_ru_seg = h_RUs[k].copy()
+                seq_samples = []
+                baseline_seq_samples = [] if enable_cnn_baseline else None
+                alpha_last = 0.0
+                for seg_idx in range(seg_count):
+                    time_idx = int(user_segment_time[k] + 1)
+                    Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
+                        H_BR,
+                        h_ru_seg,
+                        f_beam,
+                        theta_pilot,
+                        noise_std=float(pilot_noise_std_k[k]),
+                        h_BU=h_BU_k,
+                        link_switch=link_switch,
+                    )
+                    obs_real = np.real(Y_pilot)
+                    obs_imag = np.imag(Y_pilot)
+                    obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
+                    X_seq = obs_step[None, :, :]  # (1, 2, P), one continuous segment
+
+                    h_next_seg, alpha_seg = _evolve_ru_single(
+                        ru_evolver=ru_evolver,
+                        h_ru_vec=h_ru_seg,
+                        user_idx=k,
+                        time_idx=time_idx,
+                    )
+                    y_target = h_next_seg if gru_csi_target_mode == "t+1" else h_ru_seg
+                    y = _complex_to_ri(y_target)
+                    seq_samples.append((X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False)))
+
+                    if enable_cnn_baseline:
+                        Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
+                            H_BR,
+                            h_ru_seg,
+                            f_beam_baseline,
+                            theta_pilot,
+                            noise_std=float(pilot_noise_std_k[k]),
+                            h_BU=h_BU_k,
+                            link_switch=link_switch,
+                        )
+                        obs_real_baseline = np.real(Y_pilot_baseline)
+                        obs_imag_baseline = np.imag(Y_pilot_baseline)
+                        obs_step_baseline = np.stack([obs_real_baseline, obs_imag_baseline], axis=0).astype(np.float32)
+                        X_seq_baseline = obs_step_baseline[None, :, :]
+                        y_baseline = _complex_to_ri(h_ru_seg)
+                        baseline_seq_samples.append(
+                            (
+                                X_seq_baseline.astype(np.float32, copy=False),
+                                y_baseline.astype(np.float32, copy=False),
+                            )
+                        )
+
+                    h_ru_seg = h_next_seg
+                    alpha_last = alpha_seg
+                    user_segment_time[k] = time_idx
+
+                local_data_stateful[k] = seq_samples
+                local_data.append(seq_samples[-1])
+                if enable_cnn_baseline:
+                    local_data_baseline[k] = baseline_seq_samples
+                h_RUs_next[k] = h_ru_seg
+                alpha_used_next[k] = float(alpha_last)
             else:
+                Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
+                    H_BR, h_RUs[k], f_beam, theta_pilot,
+                    noise_std=float(pilot_noise_std_k[k]),
+                    h_BU=h_BU_k,
+                    link_switch=link_switch,
+                )
+
+                # Build GRU sequence input: X_seq shape (W, 2, P) --> (seq_len, 2, obs_dim)
+                obs_real = np.real(Y_pilot)  # Separate real and imag channels
+                obs_imag = np.imag(Y_pilot)
+                obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
+
                 if use_time_window and W > 1:
                     obs_buffers[k].append(obs_step)  # append current step
                     seq = list(obs_buffers[k])  # list of (2,P), length <= W
@@ -578,9 +759,9 @@ def main():
                     # Fallback: seq_len = 1
                     X_seq = obs_step[None, :, :]  # (1, 2, P)
 
-            y = _complex_to_ri(h_RUs_target_gru[k])
-            sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
-            local_data.append(sample)
+                y = _complex_to_ri(h_RUs_target_gru[k])
+                sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
+                local_data.append(sample)
 
             if (not use_persistent_hidden_state) and use_time_window and W > 1 and round_idx <= 3 and k == 0:
                 logger.info(f"Example X_seq shape for user1: {sample[0].shape}")  # (W,2,P)
@@ -623,7 +804,7 @@ def main():
                 if use_local_cache_seq_models and use_time_window and W > 1:
                     sample_buffers_arch[k].append((sample_arch[0].copy(), sample_arch[1].copy()))
 
-            if enable_cnn_baseline:
+            if enable_cnn_baseline and (not use_persistent_hidden_state):
                 Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
                     noise_std=float(pilot_noise_std_k[k]),
@@ -642,7 +823,7 @@ def main():
                     X_seq_baseline.astype(np.float32, copy=False),
                     y_baseline.astype(np.float32, copy=False),
                 )
-                local_data_baseline.append(sample_baseline)
+                local_data_baseline[k] = sample_baseline
 
         # Local training on each user's data
         local_models = []
@@ -657,12 +838,15 @@ def main():
         h_RUs_est_baseline = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64) \
             if enable_cnn_baseline else None
         state_fast_x_round = np.zeros((config.num_users,), dtype=np.float32)
+        # n_k for this round: number of samples actually used by each user in local training.
+        user_sample_count_round = np.zeros((config.num_users,), dtype=np.float32)
         # Debug-only cache: per-user hidden-state delta (current - history), no training-path impact.
         gru_state_delta_vectors = [None for _ in range(config.num_users)] \
             if (debug_gru_state_plot_dir is not None and use_persistent_hidden_state) else None
         for k in range(config.num_users):
             loss_arch = None
             loss_baseline = None
+            samples_used_k = 1
 
             # Model for user k from global weights
             local_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
@@ -674,13 +858,15 @@ def main():
 
             # Train on user k's data
             if use_persistent_hidden_state:
-                sample_k = local_data[k]
+                seq_k = local_data_stateful[k]
+                sample_k = seq_k[-1]
                 hidden_prev = user_hidden_states[k]
-                local_model, loss, hidden_next = trainer.train_stateful_step(
+                local_model, loss, hidden_next, pred_last = trainer.train_stateful_sequence(
                     local_model,
-                    sample_k,
+                    seq_k,
                     hidden_state=hidden_prev,
                 )
+                samples_used_k = max(1, len(seq_k))
                 user_hidden_states[k] = hidden_next
                 state_fast_x_round[k] = compute_hidden_drift_ratio(
                     hidden_prev=hidden_prev,
@@ -697,17 +883,21 @@ def main():
                     gru_state_delta_vectors[k] = (vec_next - vec_prev).numpy()
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
-                h_RUs_est[k] = _predict_h_ru_gru(
-                    local_model,
-                    sample_k[0],
-                    config.num_ris_elements,
-                    hidden_state=hidden_prev,
-                )
+                if pred_last is not None:
+                    h_RUs_est[k] = _ri_to_complex(pred_last.numpy(), config.num_ris_elements)
+                else:
+                    h_RUs_est[k] = _predict_h_ru_gru(
+                        local_model,
+                        sample_k[0],
+                        config.num_ris_elements,
+                        hidden_state=hidden_prev,
+                    )
             else:
                 if use_local_cache_seq_models:
                     data_k = list(sample_buffers[k])  # latest S window samples, OK if length < S
                 else:
                     data_k = [local_data[k]]  # fallback: 1 sample per epoch
+                samples_used_k = max(1, len(data_k))
                 local_model, loss = trainer.train(local_model, data_k)
                 h_RUs_est[k] = _predict_h_ru_gru(
                     local_model,
@@ -715,6 +905,7 @@ def main():
                     config.num_ris_elements,
                     hidden_state=None,
                 )
+            user_sample_count_round[k] = float(samples_used_k)
             losses.append(loss if loss is not None else 0.0)
             local_models.append(local_model)
             # cache back the personalized head for user k
@@ -777,13 +968,16 @@ def main():
                     hidden_size=int(config.cnn_baseline_hidden_size),
                 )
                 local_model_baseline.load_state_dict(global_model_baseline.state_dict())
-                data_k_baseline = [local_data_baseline[k]]
+                if use_persistent_hidden_state:
+                    data_k_baseline = local_data_baseline[k]
+                else:
+                    data_k_baseline = [local_data_baseline[k]]
                 local_model_baseline, loss_baseline = trainer.train(local_model_baseline, data_k_baseline)
                 losses_baseline.append(loss_baseline if loss_baseline is not None else 0.0)
                 local_models_baseline.append(local_model_baseline)
                 h_RUs_est_baseline[k] = _predict_h_ru_plain(
                     local_model_baseline,
-                    local_data_baseline[k][0],
+                    data_k_baseline[-1][0],
                     config.num_ris_elements,
                 )
 
@@ -873,18 +1067,17 @@ def main():
         if enable_cnn_baseline:
             old_global_vec_baseline = state_dict_to_vector(global_model_baseline).detach().cpu()
 
-        # User weights K_k for both OTA aggregation and the OTA-aware optimizer.
-        if config.ota_use_weighted_users:
-            if config.user_weight_mode == "random":
-                K_vals = np.random.uniform(config.user_data_size_min,
-                                           config.user_data_size_max,
-                                           size=(config.num_users,))
-            else:
-                K_vals = np.full((config.num_users,), float(config.ota_user_weight))
+        # Derive user weights K_k from actual per-user local sample counts n_k in this round.
+        if bool(config.ota_use_weighted_users):
+            K_vals = np.maximum(user_sample_count_round.astype(np.float32, copy=False), 1.0)
         else:
-            K_vals = np.ones((config.num_users,), dtype=float)
-        K_vec = torch.from_numpy(K_vals.astype(np.float32))
+            K_vals = np.ones((config.num_users,), dtype=np.float32)
+        K_vec = torch.from_numpy(K_vals)
         K_norm = K_vec / torch.mean(K_vec)
+        logger.info(
+            f"Round {round_idx} n_k(min/mean/max)=("
+            f"{float(K_vals.min()):.1f}/{float(K_vals.mean()):.1f}/{float(K_vals.max()):.1f})"
+        )
 
         # Prepare local update vectors once so the OTA path and the OTA-aware optimizer
         # use the same current-round update statistics.
@@ -1039,33 +1232,13 @@ def main():
 
         if enable_cnn_baseline:
             logger.info("Aggregating literature CNN baseline updates at server.")
-            if config.use_aircomp and aircomp_sim is not None:
-                agg_update_baseline, diag_baseline = aircomp_sim.aggregate_updates(
-                    updates=delta_mat_baseline.float(),
-                    h_eff=h_eff_baseline,
-                    user_weights=K_norm,
-                )
-                ideal_update_baseline = (
-                    (delta_mat_baseline * K_norm.view(-1, 1)).sum(dim=0) / (K_norm.sum() + 1e-12)
-                )
-                agg_error_power_baseline = torch.norm(agg_update_baseline - ideal_update_baseline) ** 2
-                ideal_power_baseline = torch.norm(ideal_update_baseline) ** 2
-                nmse_baseline = agg_error_power_baseline / (ideal_power_baseline + 1e-12)
-
-                aggregator_baseline.apply_aggregated_delta(global_model_baseline, agg_update_baseline, backbone_only=False)
-                logger.info(
-                    f"CNN-base AirComp eta={diag_baseline['eta']:.4e}, "
-                    f"min|u|^2={diag_baseline['min_inner2']:.4e}, "
-                    f"agg_NMSE={nmse_baseline.item():.4e}, "
-                    f"agg_err={agg_error_power_baseline.item():.4e}, "
-                    f"ideal_power={ideal_power_baseline.item():.4e}"
-                )
-            else:
-                global_model_baseline = aggregator_baseline.aggregate(
-                    global_model_baseline,
-                    local_models_baseline,
-                    backbone_only=False,
-                )
+            # Literature baseline uses full-model weighted FedAvg based on per-user data amount.
+            global_model_baseline = aggregator_baseline.aggregate(
+                global_model_baseline,
+                local_models_baseline,
+                backbone_only=False,
+                client_weights=user_sample_count_round,
+            )
 
             new_global_vec_baseline = state_dict_to_vector(global_model_baseline).detach().cpu()
             logger.info(
@@ -1133,9 +1306,10 @@ def main():
             )
 
         if enable_cnn_baseline:
+            baseline_user_weights = K_norm.numpy()
             f_beam_baseline, theta_ota_baseline, nmse_proxy_baseline = optimize_beam_ris(
                 H_BR, h_RUs_est_baseline, h_BUs=h_BUs, theta_init=theta_ota_baseline, f_init=f_beam_baseline,
-                link_switch=link_switch, user_weights=K_norm.numpy(),
+                link_switch=link_switch, user_weights=baseline_user_weights,
                 update_vars=delta_var_baseline.numpy(),
                 tx_power=config.ota_tx_power,
                 noise_std=config.ota_noise_std,
@@ -1149,7 +1323,10 @@ def main():
             )
 
         # Oracle upper-bound AO reference with true channels.
-        h_RUs_true_for_oracle = h_RUs_target_gru
+        if use_persistent_hidden_state:
+            h_RUs_true_for_oracle = h_RUs_next if gru_csi_target_mode == "t+1" else h_RUs
+        else:
+            h_RUs_true_for_oracle = h_RUs_target_gru
         f_beam_oracle, theta_ota_oracle, nmse_proxy_oracle = optimize_beam_ris(
             H_BR, h_RUs_true_for_oracle, h_BUs=h_BUs, theta_init=theta_ota_oracle, f_init=f_beam_oracle,
             link_switch=link_switch, user_weights=K_norm.numpy(),

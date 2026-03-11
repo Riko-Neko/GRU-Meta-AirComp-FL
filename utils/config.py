@@ -11,7 +11,7 @@ class Config:
     num_users = 10  # number of users (K)
     num_bs_antennas = 32  # number of BS antennas (M)
     num_ris_elements = 64  # number of RIS elements (N)
-    num_pilots = 16  # number of pilot transmissions per time slot (P)
+    num_pilots = 8  # number of pilot transmissions per time slot (P)
 
     # Path-loss settings (synthetic mode)
     alpha_direct = 3.0  # path-loss exponent for BS-UE
@@ -27,13 +27,14 @@ class Config:
     link_switch = [1, 0]
 
     # channel settings (RIS->UE link, RU)
-    channel_alpha = 0.6  # AR(1)
+    channel_alpha = 0.75  # AR(1)
     use_dynamic_alpha = False
-    dynamic_alpha_mode = "piecewise"  # "sinusoid" | "piecewise"
+    dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
     alpha_min = 0.50
     alpha_max = 0.98
-    alpha_period_rounds = 20
-    alpha_piecewise = [(5, 0.98), (10, 0.85), (15, 0.60), (20, 0.90)]
+    alpha_period_rounds = 5
+    alpha_piecewise = [(5, 0.98), (10, 0.85), (15, 0.60), (20, 0.90), (50, 0.50), (100, 0.60), (150, 0.70), (200, 0.80),
+                       (250, 0.90)]
 
     # per-user heterogeneity
     # channel dynamic (alpha_k heterogeneity)
@@ -41,14 +42,14 @@ class Config:
     alpha_user_min = 0.60
     alpha_user_max = 0.98
     # Pilot observation noise
-    use_user_pilot_snr_hetero = True
+    use_user_pilot_snr_hetero = False
     pilot_SNR_dB = 20
     pilot_snr_dB_min = 10
     pilot_snr_dB_max = 30
 
     # GRU context settings
-    gru_context_mode = "persistent_hidden" # "persistent_hidden" | "time_window"
-    gru_csi_target_mode = "t+1" # CSI supervision target for GRU: "t" | "t+1"
+    gru_context_mode = "persistent_hidden"  # "persistent_hidden" | "time_window"
+    gru_csi_target_mode = "t+1"  # CSI supervision target for GRU: "t" | "t+1"
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
     reset_hidden_on_round1 = True
@@ -73,30 +74,32 @@ class Config:
     local_cache_size = 8  # S sample cached per-user
 
     # Federated learning settings
-    num_rounds = 300  # number of communication rounds
-    local_epochs = 5  # local update epochs per round (per user)
+    num_rounds = 30  # number of communication rounds
+    local_epochs = 3  # local update epochs per round (per user)
     local_lr = 1e-3  # learning rate for local training
-    batch_size = 32  # batch size for local training (None means use all data per epoch)
+    batch_size = 8  # batch size for local training (None means use all data per epoch)
     meta_algorithm = "Reptile"  # Meta-FL algorithm ("Reptile" or "FedAvg")
-    reptile_step_size = 0.5  # step size (beta) for Reptile algorithm (if applicable)
+    reptile_step_size = 0.2  # step size (beta) for Reptile algorithm (if applicable)
 
     # AirComp and communication settings
     use_aircomp = True  # whether to simulate AirComp aggregation with noise
-    SNR_dB = 20  # SNR in dB for AirComp (if use_aircomp is True)
+    SNR_dB = 10  # SNR in dB for AirComp (if use_aircomp is True)
     noise_std = math.pow(10, - (SNR_dB / 20.0))  # noise standard deviation from SNR_dB (20 dB -> ~0.1)
     # OTA aggregation settings (Phase1)
     ota_tx_power = 0.1
     ota_var_floor = 1e-3
     ota_eps = 1e-8
-    ota_user_weight = 1.0  # scalar base weight; Phase1 uses uniform by default
     ota_noise_std = noise_std
-    ota_use_weighted_users = True
-    user_weight_mode = "uniform"  # "uniform" or "random"
-    user_data_size_min = 5000
-    user_data_size_max = 20000
+    ota_use_weighted_users = True  # if False, always use equal weights (all ones)
+    # Optional user-data partition profile (equal/grouped) for experiment bookkeeping.
+    # Runtime n_k used by OTA aggregation is computed from actual per-user local sample counts.
+    user_data_partition_mode = "grouped"  # "equal" | "grouped"
+    user_data_size_equal = 10
+    user_group_ratios = [0.3, 0.4, 0.3]  # small/medium/large user fractions, auto-normalized
+    user_group_data_sizes = [1, 10, 50]  # small/medium/large n_k for persistent segments
 
     # OA optimizer mode
-    oa_optimizer_mode = "state_aware"  # "legacy" | "state_aware"
+    oa_optimizer_mode = "legacy"  # "legacy" | "state_aware"
     oa_ao_iters = 2
     oa_theta_lr = 0.05
     oa_theta_grad_steps = 1
@@ -106,22 +109,22 @@ class Config:
     state_beta_z = 0.1
     state_alpha_z = 0.5
     state_alpha_x = 0.5
-    state_mu = 0.5
-    state_weight_min = 0.5
+    state_mu = 0.8
+    state_weight_min = 0.7
     state_weight_max = 2.0
     state_fast_clip = 2.0
     state_eps = 1e-8
-    state_strategy = "protect"  # "protect" | "stability"
+    state_strategy = "stability"  # "protect" | "stability"
 
     # Logging settings
     log_to_file = True  # whether to save logs to a file
     log_file_path = "demo.log"  # log file path if enabled
 
     # Debug visualization: per-user Reptile head parameter projection
-    enable_reptile_head_debug_plot = True
+    enable_reptile_head_debug_plot = False
     reptile_head_debug_every = 10  # save one projection figure every N rounds
     reptile_head_debug_root = "debug"
-    enable_gru_state_diff_debug_plot = True
+    enable_gru_state_diff_debug_plot = False
     gru_state_diff_debug_every = 10  # save one GRU state-diff figure every N rounds
 
     @classmethod
