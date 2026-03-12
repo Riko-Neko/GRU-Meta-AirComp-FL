@@ -9,7 +9,7 @@ import torch
 
 from aircomp_opt.OTA_sim import AirCompSimulator
 from aircomp_opt.f_theta_optim import optimize_beam_ris, optimize_beam_ris_state_aware
-from data import deepmimo, pilot_gen
+from data import RISdata, pilot_gen
 from data.channel import build_ru_channel_evolver_from_config
 from fl_core.agg import MetaUpdater
 from fl_core.reptile_agg import ReptileAggregator
@@ -40,7 +40,9 @@ def _parse_gru_target_mode(mode):
         return "t"
     if token in {"t+1", "t_plus_1", "next", "t1"}:
         return "t+1"
-    raise ValueError("Config.gru_csi_target_mode must be 't' or 't+1'")
+    if token in {"uplink_linear", "uplink", "t+tau", "t_plus_tau"}:
+        return "uplink_linear"
+    raise ValueError("Config.gru_csi_target_mode must be 't', 't+1', or 'uplink_linear'")
 
 
 BRANCH_ANSI = {
@@ -200,22 +202,6 @@ def _build_user_data_partitions(config):
     return n_k, mode, group_counts
 
 
-def _evolve_ru_single(ru_evolver, h_ru_vec, user_idx, time_idx):
-    """
-    Evolve one user's RU channel by one AR(1) step.
-    """
-    alpha_global = ru_evolver.traj.get_alpha(time_idx)
-    if ru_evolver.alpha_bases is None:
-        alpha = float(alpha_global)
-    else:
-        delta = float(alpha_global - ru_evolver.base_static_alpha)
-        alpha = float(ru_evolver.traj._clip_alpha(ru_evolver.alpha_bases[user_idx] + delta))
-    beta = math.sqrt(max(0.0, 1.0 - alpha * alpha))
-    noise = (np.random.randn(*h_ru_vec.shape) + 1j * np.random.randn(*h_ru_vec.shape)) / math.sqrt(2.0)
-    h_next = alpha * h_ru_vec + beta * noise.astype(h_ru_vec.dtype, copy=False)
-    return h_next.astype(h_ru_vec.dtype, copy=False), alpha
-
-
 def _complex_to_ri(vec_complex):
     return np.concatenate([np.real(vec_complex), np.imag(vec_complex)], axis=0).astype(np.float32)
 
@@ -227,16 +213,41 @@ def _ri_to_complex(vec_ri, n):
     return (vec[:n] + 1j * vec[n:]).astype(np.complex64)
 
 
-def _predict_h_ru_gru(model, x_seq, n_ris, hidden_state=None):
+def _build_gru_dual_target(h_t, h_t1):
+    return np.concatenate([_complex_to_ri(h_t), _complex_to_ri(h_t1)], axis=0).astype(np.float32)
+
+
+def _select_gru_ri_output(vec_ri, n_ris, mode, uplink_tau_ratio):
+    vec = np.asarray(vec_ri, dtype=np.float32).reshape(-1)
+    csi_dim = 2 * int(n_ris)
+    if vec.size != 2 * csi_dim:
+        raise ValueError(f"Expected dual-output RI vector size {2 * csi_dim}, got {vec.size}")
+    rho = float(uplink_tau_ratio)
+    if not (0.0 <= rho <= 1.0):
+        raise ValueError(f"uplink_tau_ratio must be in [0, 1], got {uplink_tau_ratio}")
+    if mode == "t":
+        return vec[:csi_dim]
+    if mode == "t+1":
+        return vec[csi_dim:]
+    if mode == "uplink_linear":
+        pred_t = vec[:csi_dim]
+        pred_t1 = vec[csi_dim:]
+        return ((1.0 - rho) * pred_t + rho * pred_t1).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported GRU output mode: {mode}")
+
+
+def _predict_h_ru_gru(model, x_seq, n_ris, mode, uplink_tau_ratio, hidden_state=None):
     model.eval()
     device = next(model.parameters()).device
     with torch.no_grad():
         x_tensor = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
         if hidden_state is not None:
-            pred = model(x_tensor, h0=hidden_state.detach().to(device), return_hidden=False)
+            pred_t, pred_t1 = model(x_tensor, h0=hidden_state.detach().to(device), return_hidden=False)
         else:
-            pred = model(x_tensor, return_hidden=False)
-    return _ri_to_complex(pred.squeeze(0).cpu().numpy(), n_ris)
+            pred_t, pred_t1 = model(x_tensor, return_hidden=False)
+    pred_dual = torch.cat([pred_t, pred_t1], dim=-1)
+    pred = _select_gru_ri_output(pred_dual.squeeze(0).cpu().numpy(), n_ris, mode, uplink_tau_ratio)
+    return _ri_to_complex(pred, n_ris)
 
 
 def _predict_h_ru_plain(model, x_seq, n_ris):
@@ -530,9 +541,14 @@ def main():
     observation_dim = config.num_pilots  # each pilot yields one observation value (if scalar) or we consider multi-dim
     # Actually, each pilot observation is complex, we consider 2 channels (real & imag)
     obs_dim = config.num_pilots
-    # Supervision target is RIS-user CSI h_RU (real-imag stacked).
+    # Single-horizon CSI target is RIS-user CSI h_RU (real-imag stacked).
+    # The GRU predicts both t and t+1, so its head output dimension is doubled internally.
     output_dim = 2 * config.num_ris_elements
     gru_csi_target_mode = _parse_gru_target_mode(config.gru_csi_target_mode)
+    uplink_tau_ratio = float(getattr(config, "uplink_tau_ratio", 0.5))
+    if not (0.0 <= uplink_tau_ratio <= 1.0):
+        raise ValueError("Config.uplink_tau_ratio must be in [0, 1]")
+    use_uplink_linear = (gru_csi_target_mode == "uplink_linear")
 
     # Per-user sliding window buffer for GRU
     W = int(config.window_length)
@@ -578,7 +594,9 @@ def main():
         f"GRU context mode={gru_context_mode}, W={W}"
     )
     logger.info(f"OA optimizer mode={oa_optimizer_mode}")
-    logger.info(f"GRU CSI target mode={gru_csi_target_mode}")
+    logger.info(f"GRU CSI output selection mode={gru_csi_target_mode} (dual-head supervised on t and t+1)")
+    if use_uplink_linear:
+        logger.info(f"GRU uplink interpolation ratio rho=tau/delta={uplink_tau_ratio:.3f}")
     logger.info("CNN-arch/CNN-base CSI target mode=t")
     global_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
     user_hidden_states = [None for _ in range(config.num_users)]
@@ -714,15 +732,27 @@ def main():
                 reason = "round1" if (round_idx == 1 and reset_hidden_on_round1) else "large_backbone_update"
                 logger.info(f"Reset persistent hidden states at round {round_idx} (reason={reason}).")
                 reset_hidden_next_round = False
+        h_RUs_uplink = None
+        alpha_used_uplink = None
         if use_persistent_hidden_state:
             # Persistent mode uses variable-length continuous segments per user.
             h_RUs_next = np.zeros_like(h_RUs)
             alpha_used_next = np.zeros((config.num_users,), dtype=np.float32)
-            h_RUs_target_gru = None
+            if use_uplink_linear:
+                h_RUs_uplink = np.zeros_like(h_RUs)
+                alpha_used_uplink = np.zeros((config.num_users,), dtype=np.float32)
         else:
             # One-step channel evolution for non-persistent mode.
-            h_RUs_next, alpha_used_next = ru_evolver.step(h_RUs, round_idx)
-            h_RUs_target_gru = h_RUs_next if gru_csi_target_mode == "t+1" else h_RUs
+            if use_uplink_linear:
+                h_RUs_uplink, h_RUs_next, alpha_used_next, alpha_used_uplink = ru_evolver.step_split(
+                    h_RUs,
+                    round_idx,
+                    uplink_tau_ratio,
+                )
+                alpha_used_next = alpha_used_next.astype(np.float32, copy=False)
+                alpha_used_uplink = alpha_used_uplink.astype(np.float32, copy=False)
+            else:
+                h_RUs_next, alpha_used_next = ru_evolver.step(h_RUs, round_idx)
 
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
@@ -738,6 +768,7 @@ def main():
                 seq_samples = []
                 baseline_seq_samples = [] if enable_cnn_baseline else None
                 alpha_last = 0.0
+                alpha_tau_last = 0.0
                 for seg_idx in range(seg_count):
                     time_idx = int(user_segment_time[k] + 1)
                     Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
@@ -754,14 +785,23 @@ def main():
                     obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
                     X_seq = obs_step[None, :, :]  # (1, 2, P), one continuous segment
 
-                    h_next_seg, alpha_seg = _evolve_ru_single(
-                        ru_evolver=ru_evolver,
-                        h_ru_vec=h_ru_seg,
-                        user_idx=k,
-                        time_idx=time_idx,
-                    )
-                    y_target = h_next_seg if gru_csi_target_mode == "t+1" else h_ru_seg
-                    y = _complex_to_ri(y_target)
+                    if use_uplink_linear:
+                        h_tau_seg, h_next_seg, alpha_seg, alpha_tau_seg = ru_evolver.step_single_split(
+                            h_ru_seg,
+                            user_idx=k,
+                            round_idx=time_idx,
+                            tau_ratio=uplink_tau_ratio,
+                        )
+                    else:
+                        h_tau_seg = None
+                        _, h_next_seg, alpha_seg, _ = ru_evolver.step_single_split(
+                            h_ru_seg,
+                            user_idx=k,
+                            round_idx=time_idx,
+                            tau_ratio=1.0,
+                        )
+                        alpha_tau_seg = 0.0
+                    y = _build_gru_dual_target(h_ru_seg, h_next_seg)
                     seq_samples.append((X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False)))
 
                     if enable_cnn_baseline:
@@ -788,12 +828,16 @@ def main():
 
                     h_ru_seg = h_next_seg
                     alpha_last = alpha_seg
+                    alpha_tau_last = alpha_tau_seg
                     user_segment_time[k] = time_idx
 
                 local_data_stateful[k] = seq_samples
                 local_data.append(seq_samples[-1])
                 if enable_cnn_baseline:
                     local_data_baseline[k] = baseline_seq_samples
+                if use_uplink_linear:
+                    h_RUs_uplink[k] = h_tau_seg
+                    alpha_used_uplink[k] = float(alpha_tau_last)
                 h_RUs_next[k] = h_ru_seg
                 alpha_used_next[k] = float(alpha_last)
             else:
@@ -823,7 +867,7 @@ def main():
                     # Fallback: seq_len = 1
                     X_seq = obs_step[None, :, :]  # (1, 2, P)
 
-                y = _complex_to_ri(h_RUs_target_gru[k])
+                y = _build_gru_dual_target(h_RUs[k], h_RUs_next[k])
                 sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
                 local_data.append(sample)
 
@@ -941,12 +985,20 @@ def main():
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
                 if pred_last is not None:
-                    h_RUs_est[k] = _ri_to_complex(pred_last.numpy(), config.num_ris_elements)
+                    pred_selected = _select_gru_ri_output(
+                        pred_last.numpy(),
+                        config.num_ris_elements,
+                        gru_csi_target_mode,
+                        uplink_tau_ratio,
+                    )
+                    h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
                 else:
                     h_RUs_est[k] = _predict_h_ru_gru(
                         local_model,
                         sample_k[0],
                         config.num_ris_elements,
+                        gru_csi_target_mode,
+                        uplink_tau_ratio,
                         hidden_state=hidden_prev,
                     )
             else:
@@ -957,6 +1009,8 @@ def main():
                     local_model,
                     local_data[k][0],
                     config.num_ris_elements,
+                    gru_csi_target_mode,
+                    uplink_tau_ratio,
                     hidden_state=None,
                 )
             user_sample_count_round[k] = float(samples_used_k)
@@ -1172,6 +1226,7 @@ def main():
         h_eff_arch = None
         h_eff_baseline = None
         if config.use_aircomp and aircomp_sim is not None:
+            h_RUs_ota = h_RUs_uplink if use_uplink_linear else h_RUs
             # Effective channels per user (complex) using each branch's own OTA variables.
             casc_pref = f_beam.conj() @ H_BR.T
             h_eff_list = []
@@ -1179,7 +1234,7 @@ def main():
                 direct = f_beam.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
                 reflect = 0.0
                 if reflect_on == 1:
-                    reflect = np.dot(theta_ota, casc_pref * h_RUs[k])
+                    reflect = np.dot(theta_ota, casc_pref * h_RUs_ota[k])
                 h_eff_list.append(direct + reflect)
             h_eff = torch.from_numpy(np.asarray(h_eff_list, dtype=np.complex64))
 
@@ -1192,7 +1247,7 @@ def main():
                     )
                     reflect_arch = 0.0
                     if reflect_on == 1:
-                        reflect_arch = np.dot(theta_ota_arch, casc_pref_arch * h_RUs[k])
+                        reflect_arch = np.dot(theta_ota_arch, casc_pref_arch * h_RUs_ota[k])
                     h_eff_list_arch.append(direct_arch + reflect_arch)
                 h_eff_arch = torch.from_numpy(np.asarray(h_eff_list_arch, dtype=np.complex64))
 
@@ -1205,7 +1260,7 @@ def main():
                     )
                     reflect_baseline = 0.0
                     if reflect_on == 1:
-                        reflect_baseline = np.dot(theta_ota_baseline, casc_pref_baseline * h_RUs[k])
+                        reflect_baseline = np.dot(theta_ota_baseline, casc_pref_baseline * h_RUs_ota[k])
                     h_eff_list_baseline.append(direct_baseline + reflect_baseline)
                 h_eff_baseline = torch.from_numpy(np.asarray(h_eff_list_baseline, dtype=np.complex64))
 
@@ -1397,10 +1452,12 @@ def main():
             )
 
         # Oracle upper-bound AO reference with true channels.
-        if use_persistent_hidden_state:
-            h_RUs_true_for_oracle = h_RUs_next if gru_csi_target_mode == "t+1" else h_RUs
+        if gru_csi_target_mode == "t+1":
+            h_RUs_true_for_oracle = h_RUs_next
+        elif gru_csi_target_mode == "uplink_linear":
+            h_RUs_true_for_oracle = h_RUs_uplink
         else:
-            h_RUs_true_for_oracle = h_RUs_target_gru
+            h_RUs_true_for_oracle = h_RUs
         f_beam_oracle, theta_ota_oracle, nmse_proxy_oracle = optimize_beam_ris(
             H_BR, h_RUs_true_for_oracle, h_BUs=h_BUs, theta_init=theta_ota_oracle, f_init=f_beam_oracle,
             link_switch=link_switch, user_weights=K_norm.numpy(),
@@ -1430,6 +1487,11 @@ def main():
             logger.info(f"RU per-user alpha_k: {alpha_used}, "
                         f"min={alpha_used.min():.4f}, max={alpha_used.max():.4f}"
                         )
+        if use_uplink_linear and (alpha_used_uplink is not None):
+            logger.info(
+                f"RU uplink alpha_tau_k: {alpha_used_uplink}, "
+                f"min={alpha_used_uplink.min():.4f}, max={alpha_used_uplink.max():.4f}"
+            )
 
     logger.info("Training process completed.")
     # Clean up logger

@@ -49,7 +49,8 @@ class Config:
 
     # GRU context settings
     gru_context_mode = "persistent_hidden"  # "persistent_hidden" | "time_window"
-    gru_csi_target_mode = "t+1"  # CSI supervision target for GRU: "t" | "t+1"
+    gru_csi_target_mode = "t+1"  # GRU output selection: "t" | "t+1" | "uplink_linear"
+    uplink_tau_ratio = 0.5  # tau / delta_t for uplink instant, used only when gru_csi_target_mode="uplink_linear"
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
     reset_hidden_on_round1 = True

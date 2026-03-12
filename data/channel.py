@@ -105,6 +105,38 @@ class RUChannelEvolverAR1:
         self.alpha_bases = None if alpha_bases is None else np.asarray(alpha_bases, dtype=float)
         self.base_static_alpha = float(base_static_alpha)
 
+    @staticmethod
+    def _validate_step_ratio(step_ratio: float) -> float:
+        ratio = float(step_ratio)
+        if not (0.0 <= ratio <= 1.0):
+            raise ValueError(f"step_ratio must be in [0, 1], got {step_ratio}")
+        return ratio
+
+    def _alpha_vec_for_round(self, round_idx: int, num_users: int) -> np.ndarray:
+        alpha_global = self.traj.get_alpha(round_idx)
+
+        # alpha_k(t) = clip(alpha_k_base + (alpha_global(t) - base_static_alpha))
+        if self.alpha_bases is None:
+            return np.full((num_users,), alpha_global, dtype=float)
+
+        delta = float(alpha_global - self.base_static_alpha)
+        return np.array([self.traj._clip_alpha(a + delta) for a in self.alpha_bases[:num_users]], dtype=float)
+
+    def alpha_vec_at(self, round_idx: int, num_users: int) -> np.ndarray:
+        return self._alpha_vec_for_round(round_idx, num_users)
+
+    def alpha_at_user(self, round_idx: int, user_idx: int) -> float:
+        return float(self._alpha_vec_for_round(round_idx, user_idx + 1)[user_idx])
+
+    @staticmethod
+    def _fractional_alpha(alpha_delta, step_ratio: float):
+        ratio = float(step_ratio)
+        if ratio <= 0.0:
+            return np.ones_like(alpha_delta, dtype=float)
+        if ratio >= 1.0:
+            return np.asarray(alpha_delta, dtype=float).copy()
+        return np.power(np.asarray(alpha_delta, dtype=float), ratio)
+
     def step(self, h_RUs: np.ndarray, round_idx: int):
         """
         Evolve h_RUs one step.
@@ -114,20 +146,69 @@ class RUChannelEvolverAR1:
         Returns:
             (h_RUs_new, alpha_used)
         """
-        alpha_global = self.traj.get_alpha(round_idx)
-
-        # alpha_k(t) = clip(alpha_k_base + (alpha_global(t) - base_static_alpha))
-        if self.alpha_bases is None:
-            alpha_vec = np.full((h_RUs.shape[0],), alpha_global, dtype=float)
-        else:
-            delta = float(alpha_global - self.base_static_alpha)
-            alpha_vec = np.array([self.traj._clip_alpha(a + delta) for a in self.alpha_bases], dtype=float)
+        alpha_vec = self._alpha_vec_for_round(round_idx, h_RUs.shape[0])
 
         beta_vec = np.sqrt(np.maximum(0.0, 1.0 - alpha_vec * alpha_vec)).astype(float)
         noise = (np.random.randn(*h_RUs.shape) + 1j * np.random.randn(*h_RUs.shape)) / np.sqrt(2.0)
 
         h_new = (alpha_vec[:, None] * h_RUs) + (beta_vec[:, None] * noise.astype(h_RUs.dtype, copy=False))
         return h_new.astype(h_RUs.dtype, copy=False), alpha_vec
+
+    def step_split(self, h_RUs: np.ndarray, round_idx: int, tau_ratio: float):
+        """
+        Split one full downlink interval into t+tau and t+1 on a consistent path.
+        Args:
+            h_RUs: shape (K, N), complex
+            round_idx: 1-based communication round
+            tau_ratio: tau / delta_t in [0, 1]
+        Returns:
+            (h_tau, h_next, alpha_delta, alpha_tau)
+        """
+        rho = self._validate_step_ratio(tau_ratio)
+        alpha_delta = self._alpha_vec_for_round(round_idx, h_RUs.shape[0])
+        alpha_tau = self._fractional_alpha(alpha_delta, rho)
+        alpha_rem = self._fractional_alpha(alpha_delta, 1.0 - rho)
+
+        beta_tau = np.sqrt(np.maximum(0.0, 1.0 - alpha_tau * alpha_tau)).astype(float)
+        noise_tau = (np.random.randn(*h_RUs.shape) + 1j * np.random.randn(*h_RUs.shape)) / np.sqrt(2.0)
+        h_tau = (alpha_tau[:, None] * h_RUs) + (beta_tau[:, None] * noise_tau.astype(h_RUs.dtype, copy=False))
+
+        beta_rem = np.sqrt(np.maximum(0.0, 1.0 - alpha_rem * alpha_rem)).astype(float)
+        noise_rem = (np.random.randn(*h_RUs.shape) + 1j * np.random.randn(*h_RUs.shape)) / np.sqrt(2.0)
+        h_next = (alpha_rem[:, None] * h_tau) + (beta_rem[:, None] * noise_rem.astype(h_RUs.dtype, copy=False))
+
+        return (
+            h_tau.astype(h_RUs.dtype, copy=False),
+            h_next.astype(h_RUs.dtype, copy=False),
+            alpha_delta.astype(float, copy=False),
+            np.asarray(alpha_tau, dtype=float),
+        )
+
+    def step_single_split(self, h_ru: np.ndarray, user_idx: int, round_idx: int, tau_ratio: float):
+        """
+        Single-user split-step evolution matching step_split semantics.
+        Returns:
+            (h_tau, h_next, alpha_delta, alpha_tau)
+        """
+        rho = self._validate_step_ratio(tau_ratio)
+        alpha_delta = self.alpha_at_user(round_idx, user_idx)
+        alpha_tau = float(self._fractional_alpha(np.asarray([alpha_delta], dtype=float), rho)[0])
+        alpha_rem = float(self._fractional_alpha(np.asarray([alpha_delta], dtype=float), 1.0 - rho)[0])
+
+        beta_tau = math.sqrt(max(0.0, 1.0 - alpha_tau * alpha_tau))
+        noise_tau = (np.random.randn(*h_ru.shape) + 1j * np.random.randn(*h_ru.shape)) / math.sqrt(2.0)
+        h_tau = alpha_tau * h_ru + beta_tau * noise_tau.astype(h_ru.dtype, copy=False)
+
+        beta_rem = math.sqrt(max(0.0, 1.0 - alpha_rem * alpha_rem))
+        noise_rem = (np.random.randn(*h_ru.shape) + 1j * np.random.randn(*h_ru.shape)) / math.sqrt(2.0)
+        h_next = alpha_rem * h_tau + beta_rem * noise_rem.astype(h_ru.dtype, copy=False)
+
+        return (
+            h_tau.astype(h_ru.dtype, copy=False),
+            h_next.astype(h_ru.dtype, copy=False),
+            float(alpha_delta),
+            float(alpha_tau),
+        )
 
 
 def build_ru_channel_evolver_from_config(config):

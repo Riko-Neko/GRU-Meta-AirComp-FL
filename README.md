@@ -100,7 +100,7 @@ All knobs live in `utils/config.py`. Key options:
 - `num_rounds`, `local_epochs`, `local_lr`, `batch_size`
 - `meta_algorithm` (`Reptile` or `FedAvg`) and `reptile_step_size`
 - `use_aircomp`, `SNR_dB`, `noise_std`
-- `gru_context_mode`, `window_length`, `window_pad_value`
+- `gru_context_mode`, `gru_csi_target_mode`, `uplink_tau_ratio`, `window_length`, `window_pad_value`
 - `use_user_pilot_snr_hetero`, `pilot_snr_dB_min`, `pilot_snr_dB_max`
 - `use_user_alpha_hetero`, `alpha_user_min`, `alpha_user_max`
 - `use_dynamic_alpha`, `dynamic_alpha_mode`, `alpha_min`, `alpha_max`, `alpha_period_rounds`, `alpha_piecewise`
@@ -117,6 +117,7 @@ Personalized split behavior (now default in code):
 - `Head` parameters are cached per user on-device and updated only by that user's local training.
 - Round 1 uses a common warm-start head copied from the same global initialization.
 - `window_pad_value` is used only when `gru_context_mode="time_window"`.
+- `gru_csi_target_mode="uplink_linear"` linearly blends the GRU dual-head outputs to approximate the uplink instant `t+tau`, while CNN baselines remain at time `t`.
 
 ## Outputs and Logging
 

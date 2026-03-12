@@ -13,6 +13,22 @@ class GRUTrainer:
         self.batch_size = batch_size
         self.device = device or torch.device('cpu')
         self.criterion = nn.MSELoss()
+
+    def _compute_loss_and_pack(self, outputs, targets):
+        """
+        Handle both single-output models and the GRU dual-head predictor.
+        Returns:
+          loss: scalar tensor
+          packed_outputs: tensor shaped like targets for downstream logging/prediction
+        """
+        if isinstance(outputs, tuple):
+            pred_t, pred_t1 = outputs
+            target_t, target_t1 = torch.chunk(targets, 2, dim=-1)
+            loss = self.criterion(pred_t, target_t) + self.criterion(pred_t1, target_t1)
+            packed_outputs = torch.cat([pred_t, pred_t1], dim=-1)
+            return loss, packed_outputs
+        loss = self.criterion(outputs, targets)
+        return loss, outputs
     
     def train(self, model, data):
         """
@@ -43,7 +59,7 @@ class GRUTrainer:
                 optimizer.zero_grad()
                 # Forward pass
                 outputs = model(X_batch)
-                loss = self.criterion(outputs, y_batch)
+                loss, _ = self._compute_loss_and_pack(outputs, y_batch)
                 # Backward and optimize
                 loss.backward()
                 optimizer.step()
@@ -64,7 +80,8 @@ class GRUTrainer:
                 X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
                 y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).unsqueeze(0)
                 pred = model(X_tensor)
-                loss = criterion(pred, y_tensor)
+                _, pred_packed = self._compute_loss_and_pack(pred, y_tensor)
+                loss = criterion(pred_packed, y_tensor)
                 total_loss += loss.item()
                 count += 1
         mse = total_loss / count if count > 0 else 0.0
@@ -92,7 +109,7 @@ class GRUTrainer:
         for _ in range(self.epochs):
             optimizer.zero_grad()
             outputs, _ = model(X_tensor, h0=h_prev, return_hidden=True)
-            loss = self.criterion(outputs, y_tensor)
+            loss, _ = self._compute_loss_and_pack(outputs, y_tensor)
             loss.backward()
             optimizer.step()
             final_loss = loss.item()
@@ -129,13 +146,13 @@ class GRUTrainer:
                 y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).unsqueeze(0)
                 optimizer.zero_grad()
                 outputs, h_next = model(X_tensor, h0=h_prev, return_hidden=True)
-                loss = self.criterion(outputs, y_tensor)
+                loss, packed_outputs = self._compute_loss_and_pack(outputs, y_tensor)
                 loss.backward()
                 optimizer.step()
                 final_loss = loss.item()
                 # Keep hidden state continuity while truncating gradient history between segments.
                 h_prev = h_next.detach()
-                last_pred = outputs.detach().cpu().squeeze(0).float()
+                last_pred = packed_outputs.detach().cpu().squeeze(0).float()
 
         if h_prev is None:
             hidden_next_cpu = None
