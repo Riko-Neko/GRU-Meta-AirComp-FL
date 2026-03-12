@@ -69,12 +69,8 @@ class Config:
     cnn_arch_hidden_size = 32
     cnn_arch_pool_mode = "last"  # "last" or "mean"
 
-    # Local sample cache (GRU / CNN-arch only; not used by literature CNN baseline)
-    use_local_sample_cache = True
-    local_cache_size = 8  # S sample cached per-user
-
     # Federated learning settings
-    num_rounds = 30  # number of communication rounds
+    num_rounds = 50  # number of communication rounds
     local_epochs = 3  # local update epochs per round (per user)
     local_lr = 1e-3  # learning rate for local training
     batch_size = 8  # batch size for local training (None means use all data per epoch)
@@ -83,7 +79,7 @@ class Config:
 
     # AirComp and communication settings
     use_aircomp = True  # whether to simulate AirComp aggregation with noise
-    SNR_dB = 10  # SNR in dB for AirComp (if use_aircomp is True)
+    SNR_dB = 0  # SNR in dB for AirComp (if use_aircomp is True)
     noise_std = math.pow(10, - (SNR_dB / 20.0))  # noise standard deviation from SNR_dB (20 dB -> ~0.1)
     # OTA aggregation settings (Phase1)
     ota_tx_power = 0.1
@@ -96,7 +92,7 @@ class Config:
     user_data_partition_mode = "grouped"  # "equal" | "grouped"
     user_data_size_equal = 10
     user_group_ratios = [0.3, 0.4, 0.3]  # small/medium/large user fractions, auto-normalized
-    user_group_data_sizes = [1, 10, 50]  # small/medium/large n_k for persistent segments
+    user_group_data_sizes = [5, 10, 20]  # small/medium/large n_k for persistent segments
 
     # OA optimizer mode
     oa_optimizer_mode = "legacy"  # "legacy" | "state_aware"
@@ -160,6 +156,6 @@ class Config:
     def log_prefix(cls) -> str:
         return (f"K{cls.num_users}_M{cls.num_bs_antennas}_N{cls.num_ris_elements}_"
                 f"P{cls.num_pilots}_W{cls.window_length}_"
-                f"S{cls.local_cache_size}_{cls.meta_algorithm}_"
+                f"{cls.meta_algorithm}_"
                 f"CTX{cls.gru_context_mode}"
                 )

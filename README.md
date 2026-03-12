@@ -16,7 +16,7 @@ The model is implemented in a personalized split form:
 - Joint beamforming and RIS phase optimization per round.
 - Optional direct (BS-UE) link and a switch to enable reflection/direct/both.
 - Time-varying RU channels via AR(1), with optional user heterogeneity and dynamic alpha(t).
-- Optional time-window GRU inputs and per-user local sample cache.
+- Optional time-window GRU inputs.
 
 ## Project Layout
 
@@ -101,7 +101,6 @@ All knobs live in `utils/config.py`. Key options:
 - `meta_algorithm` (`Reptile` or `FedAvg`) and `reptile_step_size`
 - `use_aircomp`, `SNR_dB`, `noise_std`
 - `gru_context_mode`, `window_length`, `window_pad_value`
-- `use_local_sample_cache`, `local_cache_size`
 - `use_user_pilot_snr_hetero`, `pilot_snr_dB_min`, `pilot_snr_dB_max`
 - `use_user_alpha_hetero`, `alpha_user_min`, `alpha_user_max`
 - `use_dynamic_alpha`, `dynamic_alpha_mode`, `alpha_min`, `alpha_max`, `alpha_period_rounds`, `alpha_piecewise`

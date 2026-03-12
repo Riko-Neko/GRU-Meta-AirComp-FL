@@ -43,6 +43,81 @@ def _parse_gru_target_mode(mode):
     raise ValueError("Config.gru_csi_target_mode must be 't' or 't+1'")
 
 
+BRANCH_ANSI = {
+    "GRU": "34",
+    "CNN-arch": "35",
+    "CNN-base": "36",
+    "Oracle-true": "33",
+}
+
+WEIGHT_GROUP_ANSI = {
+    "equal": "32",
+    "small": "33",
+    "medium": "36",
+    "large": "35",
+}
+
+
+def _ansi(text, code):
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _highlight_metric_value(value, branch_name):
+    color = BRANCH_ANSI.get(branch_name, "37")
+    return _ansi(f"{float(value):.4e}", f"1;{color}")
+
+
+def _colorize_branch_line(branch_name, text):
+    color = BRANCH_ANSI.get(branch_name)
+    if color is None:
+        return text
+    return _ansi(text, color)
+
+
+def _build_weight_category_map(raw_weights):
+    unique_vals = sorted({int(round(float(v))) for v in np.asarray(raw_weights).reshape(-1).tolist()})
+    if len(unique_vals) == 1:
+        return {unique_vals[0]: ("E", "equal")}
+    if len(unique_vals) == 2:
+        return {
+            unique_vals[0]: ("S", "small"),
+            unique_vals[1]: ("L", "large"),
+        }
+    category_tokens = [("S", "small"), ("M", "medium"), ("L", "large")]
+    mapping = {}
+    for idx, raw in enumerate(unique_vals):
+        token = category_tokens[idx] if idx < len(category_tokens) else (f"C{idx + 1}", "equal")
+        mapping[raw] = token
+    return mapping
+
+
+def _format_ota_weight_logs(raw_weights, norm_weights, *, chunk_size=5):
+    raw_arr = np.asarray(raw_weights, dtype=np.float32).reshape(-1)
+    norm_arr = np.asarray(norm_weights, dtype=np.float32).reshape(-1)
+    category_map = _build_weight_category_map(raw_arr)
+
+    legend_parts = []
+    for raw in sorted(category_map.keys()):
+        token, label = category_map[raw]
+        color = WEIGHT_GROUP_ANSI.get(label, "37")
+        legend_parts.append(_ansi(f"{token}:n={raw}", color))
+    lines = []
+    if legend_parts:
+        lines.append("OTA weight groups: " + " | ".join(legend_parts))
+
+    entries = []
+    for user_idx, (raw, norm) in enumerate(zip(raw_arr, norm_arr), start=1):
+        token, label = category_map[int(round(float(raw)))]
+        color = WEIGHT_GROUP_ANSI.get(label, "37")
+        entry = f"u{user_idx:02d}[{token}] n={float(raw):.1f}, w={float(norm):.2f}"
+        entries.append(_ansi(entry, color))
+
+    for start in range(0, len(entries), chunk_size):
+        end = min(start + chunk_size, len(entries))
+        lines.append(f"OTA per-user weights [{start + 1:02d}-{end:02d}]: " + " | ".join(entries[start:end]))
+    return lines
+
+
 def _allocate_counts_by_ratio(total_count, ratios):
     """Allocate integer counts by ratio with largest-remainder rounding."""
     total_count = int(total_count)
@@ -505,14 +580,6 @@ def main():
     logger.info(f"OA optimizer mode={oa_optimizer_mode}")
     logger.info(f"GRU CSI target mode={gru_csi_target_mode}")
     logger.info("CNN-arch/CNN-base CSI target mode=t")
-    # Per-user local sample cache for GRU/CNN-arch only.
-    # Literature CNN baseline stays memoryless and never uses this cache.
-    S = int(config.local_cache_size)
-    use_local_cache_seq_models = bool(config.use_local_sample_cache) and (S > 1)
-    sample_buffers = [deque(maxlen=S) for _ in range(config.num_users)]
-    logger.info(f"Local sample cache (GRU/CNN-arch) enabled={use_local_cache_seq_models}, S={S}")
-    if use_persistent_hidden_state and use_local_cache_seq_models:
-        logger.info("Persistent-hidden GRU path bypasses local sample cache (continuous-segment update).")
     global_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
     user_hidden_states = [None for _ in range(config.num_users)]
     user_segment_time = np.zeros((config.num_users,), dtype=np.int64)
@@ -554,7 +621,6 @@ def main():
     f_beam_arch = None
     theta_ota_arch = None
     obs_buffers_arch = None
-    sample_buffers_arch = None
     if enable_cnn_arch_ablation:
         global_model_arch = CSICNNArch(
             observation_dim=obs_dim,
@@ -569,7 +635,6 @@ def main():
         }
         user_head_states_arch = [copy.deepcopy(global_head_state_arch) for _ in range(config.num_users)]
         obs_buffers_arch = [deque(maxlen=W) for _ in range(config.num_users)]
-        sample_buffers_arch = [deque(maxlen=S) for _ in range(config.num_users)]
         if config.meta_algorithm.lower() == "reptile":
             aggregator_arch = ReptileAggregator(
                 step_size=config.reptile_step_size,
@@ -615,7 +680,6 @@ def main():
             "Literature CNN baseline enabled=True "
             "(single-step input, full-model FedAvg, non-stateful)."
         )
-        logger.info("Literature CNN baseline local cache is disabled by design.")
 
     # Oracle upper-bound reference branch (true CSI driven AO only, no model training).
     f_beam_oracle = f_beam.copy()
@@ -766,10 +830,6 @@ def main():
             if (not use_persistent_hidden_state) and use_time_window and W > 1 and round_idx <= 3 and k == 0:
                 logger.info(f"Example X_seq shape for user1: {sample[0].shape}")  # (W,2,P)
 
-            # push into local cache
-            if use_local_cache_seq_models and (not use_persistent_hidden_state):
-                sample_buffers[k].append((sample[0].copy(), sample[1].copy()))  # copy for safety
-
             if enable_cnn_arch_ablation:
                 Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_arch, theta_pilot,
@@ -801,9 +861,6 @@ def main():
                     y_arch.astype(np.float32, copy=False),
                 )
                 local_data_arch.append(sample_arch)
-                if use_local_cache_seq_models and use_time_window and W > 1:
-                    sample_buffers_arch[k].append((sample_arch[0].copy(), sample_arch[1].copy()))
-
             if enable_cnn_baseline and (not use_persistent_hidden_state):
                 Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
@@ -893,10 +950,7 @@ def main():
                         hidden_state=hidden_prev,
                     )
             else:
-                if use_local_cache_seq_models:
-                    data_k = list(sample_buffers[k])  # latest S window samples, OK if length < S
-                else:
-                    data_k = [local_data[k]]  # fallback: 1 sample per epoch
+                data_k = [local_data[k]]
                 samples_used_k = max(1, len(data_k))
                 local_model, loss = trainer.train(local_model, data_k)
                 h_RUs_est[k] = _predict_h_ru_gru(
@@ -941,10 +995,7 @@ def main():
                 for hk, hv in user_head_states_arch[k].items():
                     state_arch[hk] = hv.clone()
                 local_model_arch.load_state_dict(state_arch)
-                if use_local_cache_seq_models and use_time_window and W > 1:
-                    data_k_arch = list(sample_buffers_arch[k])
-                else:
-                    data_k_arch = [local_data_arch[k]]
+                data_k_arch = [local_data_arch[k]]
                 local_model_arch, loss_arch = trainer.train(local_model_arch, data_k_arch)
                 losses_arch.append(loss_arch if loss_arch is not None else 0.0)
                 local_models_arch.append(local_model_arch)
@@ -1075,9 +1126,14 @@ def main():
         K_vec = torch.from_numpy(K_vals)
         K_norm = K_vec / torch.mean(K_vec)
         logger.info(
-            f"Round {round_idx} n_k(min/mean/max)=("
-            f"{float(K_vals.min()):.1f}/{float(K_vals.mean()):.1f}/{float(K_vals.max()):.1f})"
+            _ansi(
+                f"Round {round_idx} n_k(min/mean/max)=("
+                f"{float(K_vals.min()):.1f}/{float(K_vals.mean()):.1f}/{float(K_vals.max()):.1f})",
+                "1;32",
+            )
         )
+        for weight_line in _format_ota_weight_logs(K_vals, K_norm.numpy(), chunk_size=5):
+            logger.info(weight_line)
 
         # Prepare local update vectors once so the OTA path and the OTA-aware optimizer
         # use the same current-round update statistics.
@@ -1168,9 +1224,12 @@ def main():
             # Apply aggregated delta via FedAvg/Reptile semantics
             aggregator.apply_aggregated_delta(global_model, agg_update, backbone_only=True, prefix="backbone")
             logger.info(
-                f"AirComp eta={diag['eta']:.4e}, min|u|^2={diag['min_inner2']:.4e}, "
-                f"agg_NMSE={nmse.item():.4e}, agg_err={agg_error_power.item():.4e}, "
-                f"ideal_power={ideal_power.item():.4e}"
+                _colorize_branch_line(
+                    "GRU",
+                    f"AirComp eta={diag['eta']:.4e}, min|u|^2={diag['min_inner2']:.4e}, "
+                    f"agg_NMSE={_highlight_metric_value(nmse.item(), 'GRU')}, "
+                    f"agg_err={agg_error_power.item():.4e}, ideal_power={ideal_power.item():.4e}",
+                )
             )
 
         else:
@@ -1210,11 +1269,14 @@ def main():
                     prefix="backbone",
                 )
                 logger.info(
-                    f"CNN-arch AirComp eta={diag_arch['eta']:.4e}, "
-                    f"min|u|^2={diag_arch['min_inner2']:.4e}, "
-                    f"agg_NMSE={nmse_arch.item():.4e}, "
-                    f"agg_err={agg_error_power_arch.item():.4e}, "
-                    f"ideal_power={ideal_power_arch.item():.4e}"
+                    _colorize_branch_line(
+                        "CNN-arch",
+                        f"CNN-arch AirComp eta={diag_arch['eta']:.4e}, "
+                        f"min|u|^2={diag_arch['min_inner2']:.4e}, "
+                        f"agg_NMSE={_highlight_metric_value(nmse_arch.item(), 'CNN-arch')}, "
+                        f"agg_err={agg_error_power_arch.item():.4e}, "
+                        f"ideal_power={ideal_power_arch.item():.4e}",
+                    )
                 )
             else:
                 global_model_arch = aggregator_arch.aggregate(
@@ -1287,7 +1349,13 @@ def main():
         # New pilot pattern independent from OTA theta
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
         logger.info(f"Optimized f: {np.round(f_beam, 4)}")
-        logger.info(f"Optimized theta_ota: {np.round(theta_ota, 4)}, proxy_NMSE={nmse_proxy:.4e}")
+        logger.info(
+            _colorize_branch_line(
+                "GRU",
+                f"Optimized theta_ota: {np.round(theta_ota, 4)}, "
+                f"proxy_NMSE={_highlight_metric_value(nmse_proxy, 'GRU')}",
+            )
+        )
 
         if enable_cnn_arch_ablation:
             f_beam_arch, theta_ota_arch, nmse_proxy_arch = optimize_beam_ris(
@@ -1301,8 +1369,11 @@ def main():
             )
             logger.info(f"Optimized f (CNN-arch): {np.round(f_beam_arch, 4)}")
             logger.info(
-                f"Optimized theta_ota (CNN-arch): {np.round(theta_ota_arch, 4)}, "
-                f"proxy_NMSE={nmse_proxy_arch:.4e}"
+                _colorize_branch_line(
+                    "CNN-arch",
+                    f"Optimized theta_ota (CNN-arch): {np.round(theta_ota_arch, 4)}, "
+                    f"proxy_NMSE={_highlight_metric_value(nmse_proxy_arch, 'CNN-arch')}",
+                )
             )
 
         if enable_cnn_baseline:
@@ -1318,8 +1389,11 @@ def main():
             )
             logger.info(f"Optimized f (CNN-base): {np.round(f_beam_baseline, 4)}")
             logger.info(
-                f"Optimized theta_ota (CNN-base): {np.round(theta_ota_baseline, 4)}, "
-                f"proxy_NMSE={nmse_proxy_baseline:.4e}"
+                _colorize_branch_line(
+                    "CNN-base",
+                    f"Optimized theta_ota (CNN-base): {np.round(theta_ota_baseline, 4)}, "
+                    f"proxy_NMSE={_highlight_metric_value(nmse_proxy_baseline, 'CNN-base')}",
+                )
             )
 
         # Oracle upper-bound AO reference with true channels.
@@ -1338,8 +1412,11 @@ def main():
         )
         logger.info(f"Optimized f (Oracle-true): {np.round(f_beam_oracle, 4)}")
         logger.info(
-            f"Optimized theta_ota (Oracle-true): {np.round(theta_ota_oracle, 4)}, "
-            f"proxy_NMSE={nmse_proxy_oracle:.4e}"
+            _colorize_branch_line(
+                "Oracle-true",
+                f"Optimized theta_ota (Oracle-true): {np.round(theta_ota_oracle, 4)}, "
+                f"proxy_NMSE={_highlight_metric_value(nmse_proxy_oracle, 'Oracle-true')}",
+            )
         )
 
         # Advance channels to the precomputed next-round state.
