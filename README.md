@@ -1,140 +1,226 @@
 # GRU Meta-AirComp-FL for RIS-Assisted Channel Estimation
 
-This project simulates a RIS-assisted AirComp-FL system for fast personalized cascaded channel estimation. User devices run lightweight CNN+GRU regression on few pilots and few local steps, while the server performs Reptile-style meta aggregation and jointly optimizes the BS receive beamformer `f` and RIS phase shifts `theta` to reduce over-the-air (OTA) aggregation distortion.
+This repository contains a research-oriented simulation for RIS-assisted channel estimation under federated learning and over-the-air aggregation (AirComp).
 
-The model is implemented in a personalized split form:
-- Shared `Backbone` (`Conv1D + GRU`) captures cross-user spatio-temporal pilot features and is OTA-aggregated.
-- Local `Head` (single FC layer) adapts to user-specific channel dynamics and is never OTA-aggregated.
-- Head initialization uses warm-start: all users copy the same global initial head in round 1, then keep local personalized heads afterward.
+The main branch of the code uses:
 
-## Highlights
+- synthetic BS-RIS-user channels;
+- a shared CNN+GRU backbone with personalized local heads;
+- Reptile or FedAvg style aggregation;
+- optional AirComp noise and OTA-aware beam/RIS optimization;
+- optional CNN ablations and an oracle physics-only reference branch.
 
-- RIS-assisted cascaded channel estimation with CNN+GRU regression.
-- Meta-FL with Reptile (or FedAvg fallback) across users.
-- Personalized FL split: shared backbone + local per-user head.
-- AirComp aggregation distortion modeling with configurable SNR.
-- Joint beamforming and RIS phase optimization per round.
-- Optional direct (BS-UE) link and a switch to enable reflection/direct/both.
-- Time-varying RU channels via AR(1), with optional user heterogeneity and dynamic alpha(t).
-- Optional time-window GRU inputs.
+## Current Status
 
-## Project Layout
+The default and recommended path is the synthetic-data simulation driven by `main.py` and `utils/config.py`.
+
+The repository also contains a measurement-data loader utility in `data/RISdata.py`, but the non-synthetic branch in `main.py` still has legacy dataset-loading code and is not fully wired to that loader. In practice:
+
+- `use_synthetic_data = True` is the path that currently matches the codebase and existing logs/figures.
+- Real-data experiments require additional integration work before they can be treated as a supported workflow.
+
+## What The Project Does
+
+Each communication round follows this high-level loop:
+
+1. Generate pilot observations for every user from the current BS beamformer, RIS phase pattern, and channels.
+2. Build GRU inputs either as single-step observations with persistent hidden states or as explicit time windows.
+3. Train one local model per user.
+4. Aggregate only the shared backbone updates at the server, while keeping each user's prediction head local.
+5. Simulate OTA aggregation distortion when AirComp is enabled.
+6. Optimize the BS beamformer `f` and RIS phase vector `theta` for the next round.
+7. Evolve the RIS-user channels with AR(1) dynamics, optionally with user heterogeneity or time-varying alpha.
+
+## Main Components
 
 ```text
 .
 ├── aircomp_opt/
-│   ├── OTA_sim.py               # AirComp aggregation simulator (noise injection)
-│   └── f_theta_optim.py          # Joint BS beamformer and RIS phase optimization
+│   ├── OTA_sim.py          # AirComp aggregation simulator
+│   └── f_theta_optim.py    # Legacy and state-aware beam/RIS optimization
 ├── data/
-│   ├── channel.py                # AR(1) RU channel evolution and alpha(t) schedules
-│   ├── deepmimo.py               # DeepMIMO loader and format adapters
-│   └── pilot_gen.py              # Pilot pattern generation and observation simulation
+│   ├── RISdata.py          # RIS-S21 measurement loader utilities
+│   ├── channel.py          # AR(1) channel evolution and alpha scheduling
+│   └── pilot_gen.py        # Pilot generation and observation simulation
 ├── fl_core/
-│   ├── agg.py                    # Meta updater (FedAvg + AirComp option)
-│   ├── reptile_agg.py            # Reptile meta-aggregation
-│   └── trainer.py                # Local training loop
+│   ├── agg.py              # FedAvg-style aggregation helpers
+│   ├── model_vector.py     # Model/state flattening utilities
+│   ├── reptile_agg.py      # Reptile aggregation helper
+│   ├── state_metrics.py    # State-aware weighting metrics
+│   └── trainer.py          # Local training loops
 ├── model/
-│   └── csi_cnn_gru.py             # CNN+GRU model for cascaded channel regression
+│   ├── csi_cnn_arch.py     # CNN architecture ablation
+│   ├── csi_cnn_baseline.py # Literature-style CNN baseline
+│   └── csi_cnn_gru.py      # Main shared-backbone + local-head GRU model
 ├── utils/
-│   ├── config.py                 # All simulation and training hyperparameters
-│   └── logger.py                 # Simple console/file logger
-├── main.py                       # End-to-end simulation entry point
-└── README.md
+│   ├── config.py           # Simulation and training configuration
+│   ├── log_plotter.py      # Parse logs and plot round metrics
+│   └── logger.py           # Console/file logger
+├── debug/                  # Optional debug figures
+├── figs/                   # Auto-generated summary figures
+├── log/                    # Training logs
+└── main.py                 # End-to-end simulation entry point
 ```
 
-## How It Works (High Level)
+## Model Branches
 
-1. Generate pilot observations using current `H_BR`, `h_RU`, optional `h_BU`, beam `f`, and RIS phases `theta`.
-2. Build per-user GRU context according to `gru_context_mode`:
-   `persistent_hidden` uses single-step inputs plus carried hidden states;
-   `time_window` uses an explicit padded window of length `window_length`.
-3. For each user, load global backbone + local cached head (round-1 head is warm-started from global init), then run local training.
-4. Build local update vectors from backbone parameters only.
-5. Aggregate backbone updates at the server with Reptile (or FedAvg), optionally through AirComp noise.
-6. Keep all user heads local (no OTA aggregation, no server overwrite).
-7. Optimize `f` and `theta` for the next round.
-8. Evolve RU channels with AR(1) dynamics (optional heterogeneity and dynamic alpha).
+`main.py` can run several branches side by side:
+
+- `GRU`: the main method, using a shared CNN+GRU backbone and per-user local heads.
+- `CNN-arch`: an architecture ablation that replaces the GRU backbone with a non-stateful CNN pooling backbone while keeping the same FL/OTA setup.
+- `CNN-base`: a literature-style memoryless CNN baseline with full-model FedAvg aggregation.
+- `Oracle-true`: an upper-bound reference that skips learning and optimizes the physical layer using true channel information.
+
+The main personalization rule in the GRU branch is:
+
+- backbone parameters are aggregated globally;
+- head parameters stay on-device and are never OTA-aggregated;
+- the first round warm-starts all local heads from the same global initialization.
 
 ## Requirements
 
-- Python 3.8+ (recommended)
+The repository currently declares these runtime dependencies in `requirements.txt`:
+
 - `numpy`
 - `torch`
+- `matplotlib`
 
-Install dependencies:
+Install them with:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Quick Start (Synthetic Data)
+If you plan to use the RIS-S21 MATLAB loader in `data/RISdata.py`, install `scipy` as an extra dependency:
 
-1. Ensure `use_synthetic_data = True` in `utils/config.py`.
-2. Run the simulation:
+```bash
+pip install scipy
+```
+
+## Quick Start
+
+The default configuration already points to the synthetic-data path.
 
 ```bash
 python main.py
 ```
 
-## Using DeepMIMO Data
+By default, the script will:
 
-Set `use_synthetic_data = False` and provide `deepmimo_path` in `utils/config.py`.
+- initialize synthetic channels;
+- run 50 communication rounds;
+- write a log file under `log/`;
+- generate a round-metric figure under `figs/` when the run finishes.
 
-Supported file formats:
+## Important Configuration Knobs
 
-- `.npz` archive containing `H_BR` and one of `h_RU`, `h_RUs`, or `H_RU`. Optional direct link keys: `h_BU`, `h_BUs`, or `H_BU`.
-- `.npy` containing a dict with the same keys.
-- `.npy` containing a 2D array `(K, N)` interpreted as `h_RU` with a fallback `H_BR` of ones.
+All configuration lives in `utils/config.py`.
 
-Expected shapes:
+### Data and topology
 
-- `H_BR`: `(N, M)` complex
-- `h_RU`: `(K, N)` complex, or `(K, T, N)` for multiple snapshots (first snapshot used)
-- `h_BU`: `(K, M)` complex, or `(K, T, M)` if provided (optional direct link)
+- `use_synthetic_data`
+- `num_users`
+- `num_bs_antennas`
+- `num_ris_elements`
+- `num_pilots`
+- `link_switch`
 
-## Configuration Guide
+### Channel dynamics
 
-All knobs live in `utils/config.py`. Key options:
+- `channel_alpha`
+- `use_dynamic_alpha`
+- `dynamic_alpha_mode`
+- `alpha_min`, `alpha_max`, `alpha_period_rounds`
+- `use_user_alpha_hetero`
+- `use_user_pilot_snr_hetero`
 
-- `num_users`, `num_bs_antennas`, `num_ris_elements`, `num_pilots`
-- `num_rounds`, `local_epochs`, `local_lr`, `batch_size`
-- `meta_algorithm` (`Reptile` or `FedAvg`) and `reptile_step_size`
-- `use_aircomp`, `SNR_dB`, `noise_std`
-- `gru_context_mode`, `gru_csi_target_mode`, `uplink_tau_ratio`, `window_length`, `window_pad_value`
-- `use_user_pilot_snr_hetero`, `pilot_snr_dB_min`, `pilot_snr_dB_max`
-- `use_user_alpha_hetero`, `alpha_user_min`, `alpha_user_max`
-- `use_dynamic_alpha`, `dynamic_alpha_mode`, `alpha_min`, `alpha_max`, `alpha_period_rounds`, `alpha_piecewise`
-- `ota_use_weighted_users`, `user_data_partition_mode`, `user_data_size_equal`, `user_group_ratios`, `user_group_data_sizes`
-- `link_switch` `[reflect, direct]`: `[1,0]` reflection only, `[0,1]` direct only (no RIS), `[1,1]` both, `[0,0]` invalid
+### GRU context and prediction target
 
-OTA user weights:
-- If `ota_use_weighted_users=True`, `n_k` is computed each round from the actual number of local samples used by user `k` in local training.
-- If `ota_use_weighted_users=False`, all users use equal weight.
-- In `gru_context_mode="persistent_hidden"`, per-user local sample counts are driven by `user_data_partition_mode`, `user_data_size_equal`, and `user_group_data_sizes` (continuous segments, state retained).
+- `gru_context_mode`: `persistent_hidden` or `time_window`
+- `gru_csi_target_mode`: `t`, `t+1`, or `uplink_linear`
+- `window_length`
+- `window_pad_value`
+- `reset_hidden_on_round1`
 
-Personalized split behavior (now default in code):
-- `Backbone` parameters are the only part used to compute OTA/Fed updates.
-- `Head` parameters are cached per user on-device and updated only by that user's local training.
-- Round 1 uses a common warm-start head copied from the same global initialization.
-- `window_pad_value` is used only when `gru_context_mode="time_window"`.
-- `gru_csi_target_mode="uplink_linear"` linearly blends the GRU dual-head outputs to approximate the uplink instant `t+tau`, while CNN baselines remain at time `t`.
+### Federated optimization
 
-## Outputs and Logging
+- `meta_algorithm`: `Reptile` or `FedAvg`
+- `reptile_step_size`
+- `local_epochs`
+- `local_lr`
+- `batch_size`
+- `ota_use_weighted_users`
+- `user_data_partition_mode`
+- `user_group_ratios`
+- `user_group_data_sizes`
 
-- Console logs are always printed.
-- If `log_to_file = True`, logs are written under `./log/` with a config fingerprint (see `utils/logger.py`).
-- AirComp metrics (`eta`, `min|u|^2`, `agg_NMSE`, `agg_err`, `ideal_power`) refer to backbone-update aggregation quality.
+### AirComp and physical-layer optimization
 
-## Reproducibility
+- `use_aircomp`
+- `SNR_dB`
+- `ota_tx_power`
+- `ota_var_floor`
+- `oa_optimizer_mode`: `legacy` or `state_aware`
+- `oa_ao_iters`
+- `oa_theta_lr`
+- `oa_theta_grad_steps`
 
-- `main.py` sets fixed seeds for NumPy and PyTorch to `0` by default.
+### Optional branches and debug output
 
-## Notes and Limitations
+- `enable_cnn_baseline`
+- `enable_cnn_arch_ablation`
+- `enable_reptile_head_debug_plot`
+- `enable_gru_state_diff_debug_plot`
 
-- This is a research-style simulation, not an optimized production system.
-- GPU acceleration is not enabled by default in the trainer.
-- DeepMIMO datasets are not bundled with this repository.
+## Outputs
+
+The run produces three main kinds of artifacts:
+
+- `log/*.log`: per-round training and aggregation logs with a configuration fingerprint in the filename;
+- `figs/*.png`: summary curves parsed from the log after the run ends;
+- `debug/.../*.png`: optional Reptile head projections and GRU state-delta diagnostics when debug plotting is enabled.
+
+The log parser extracts metrics such as:
+
+- mean local loss per round;
+- global update norm;
+- AirComp aggregation NMSE;
+- post-optimization proxy NMSE.
+
+## Data Support Notes
+
+### Synthetic data
+
+This is the supported path today. `main.py` builds:
+
+- a random BS-RIS channel `H_BR`;
+- per-user RIS-UE channels `h_RUs`;
+- optional direct BS-UE channels `h_BUs`;
+- per-round pilot observations through `data/pilot_gen.py`.
+
+### RIS-S21 loader utility
+
+`data/RISdata.py` provides a general-purpose loader for the 2023 RIS-S21 measurement dataset and supports:
+
+- subset selection;
+- geometry filtering;
+- frequency-bin selection;
+- optional SNR proxy filtering.
+
+However, it is currently a utility module rather than a fully integrated `main.py` data path.
+
+### External data caveat
+
+The external-data branch in `main.py` still references a legacy `deepmimo.load_data(...)` call, while the repository no longer ships `data/deepmimo.py`. That means README guidance should treat real-data use as an extension point, not a finished workflow.
+
+## Known Limitations
+
+- Configuration is hard-coded in `utils/config.py`; there is no CLI or experiment launcher.
+- The supported execution path is the synthetic simulation.
+- Real-data integration is incomplete and requires code changes before use.
+- Training runs on CPU by default unless you modify the trainer/model placement.
+- `requirements.txt` does not include optional dataset-loader dependencies such as `scipy`.
 
 ## License
 
-No license file is included. If you intend to reuse or distribute this code, add an appropriate license.
+This project is released under the MIT License. See `LICENSE`.
