@@ -7,7 +7,7 @@ class CSICNNGRU(nn.Module):
     CNN+GRU model for cascaded channel estimation.
     Split into a shared backbone (conv + GRU) and a per-user head (single FC).
     Input: sequence of pilot observations (seq_len x observation_dim with real+imag channels).
-    Output: two estimated cascaded channel vectors (t and t+1, real+imag stacked).
+    Output: two estimated cascaded channel vectors (t and delta=(t+1)-t, real+imag stacked).
     """
 
     def __init__(self, observation_dim, output_dim, conv_filters=8, conv_kernel=3, hidden_size=32):
@@ -19,7 +19,7 @@ class CSICNNGRU(nn.Module):
         self.backbone_gru = nn.GRU(input_size=self.gru_input_size, hidden_size=hidden_size, batch_first=True)
         self.relu = nn.ReLU()
 
-        # Head: per-user dual-horizon predictor kept local (not OTA-aggregated).
+        # Head: per-user dual-head predictor kept local (not OTA-aggregated).
         self.head = nn.Linear(hidden_size, 2 * output_dim)
 
     def forward_backbone(self, x, h0=None, return_hidden=False):
@@ -41,8 +41,8 @@ class CSICNNGRU(nn.Module):
     def forward_head(self, feat):
         """Apply per-user head to backbone features."""
         out = self.head(feat)
-        csi_t_hat, csi_t1_hat = torch.chunk(out, 2, dim=-1)
-        return csi_t_hat, csi_t1_hat
+        csi_t_hat, csi_delta_hat = torch.chunk(out, 2, dim=-1)
+        return csi_t_hat, csi_delta_hat
 
     def forward(self, x, h0=None, return_hidden=False):
         if return_hidden:

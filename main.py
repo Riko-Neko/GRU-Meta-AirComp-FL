@@ -213,40 +213,55 @@ def _ri_to_complex(vec_ri, n):
     return (vec[:n] + 1j * vec[n:]).astype(np.complex64)
 
 
-def _build_gru_dual_target(h_t, h_t1):
-    return np.concatenate([_complex_to_ri(h_t), _complex_to_ri(h_t1)], axis=0).astype(np.float32)
-
-
-def _select_gru_ri_output(vec_ri, n_ris, mode, uplink_tau_ratio):
+def _split_gru_dual_ri(vec_ri, n_ris):
     vec = np.asarray(vec_ri, dtype=np.float32).reshape(-1)
     csi_dim = 2 * int(n_ris)
     if vec.size != 2 * csi_dim:
         raise ValueError(f"Expected dual-output RI vector size {2 * csi_dim}, got {vec.size}")
+    return vec[:csi_dim].astype(np.float32, copy=False), vec[csi_dim:].astype(np.float32, copy=False)
+
+
+def _build_gru_dual_target(h_t, h_t1):
+    h_t_arr = np.asarray(h_t, dtype=np.complex64)
+    h_t1_arr = np.asarray(h_t1, dtype=np.complex64)
+    h_delta = h_t1_arr - h_t_arr
+    return np.concatenate([_complex_to_ri(h_t_arr), _complex_to_ri(h_delta)], axis=0).astype(np.float32)
+
+
+def _select_gru_ri_output(vec_ri, n_ris, mode, uplink_tau_ratio):
     rho = float(uplink_tau_ratio)
     if not (0.0 <= rho <= 1.0):
         raise ValueError(f"uplink_tau_ratio must be in [0, 1], got {uplink_tau_ratio}")
+    pred_t, pred_delta = _split_gru_dual_ri(vec_ri, n_ris)
+    pred_t1 = pred_t + pred_delta
     if mode == "t":
-        return vec[:csi_dim]
+        return pred_t
     if mode == "t+1":
-        return vec[csi_dim:]
+        return pred_t1.astype(np.float32, copy=False)
     if mode == "uplink_linear":
-        pred_t = vec[:csi_dim]
-        pred_t1 = vec[csi_dim:]
-        return ((1.0 - rho) * pred_t + rho * pred_t1).astype(np.float32, copy=False)
+        return (pred_t + rho * pred_delta).astype(np.float32, copy=False)
     raise ValueError(f"Unsupported GRU output mode: {mode}")
 
 
-def _predict_h_ru_gru(model, x_seq, n_ris, mode, uplink_tau_ratio, hidden_state=None):
+def _predict_gru_dual_ri(model, x_seq, hidden_state=None):
     model.eval()
     device = next(model.parameters()).device
     with torch.no_grad():
         x_tensor = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
         if hidden_state is not None:
-            pred_t, pred_t1 = model(x_tensor, h0=hidden_state.detach().to(device), return_hidden=False)
+            pred_t, pred_delta = model(x_tensor, h0=hidden_state.detach().to(device), return_hidden=False)
         else:
-            pred_t, pred_t1 = model(x_tensor, return_hidden=False)
-    pred_dual = torch.cat([pred_t, pred_t1], dim=-1)
-    pred = _select_gru_ri_output(pred_dual.squeeze(0).cpu().numpy(), n_ris, mode, uplink_tau_ratio)
+            pred_t, pred_delta = model(x_tensor, return_hidden=False)
+    return (
+        pred_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False),
+        pred_delta.squeeze(0).cpu().numpy().astype(np.float32, copy=False),
+    )
+
+
+def _predict_h_ru_gru(model, x_seq, n_ris, mode, uplink_tau_ratio, hidden_state=None):
+    pred_t, pred_delta = _predict_gru_dual_ri(model, x_seq, hidden_state=hidden_state)
+    pred_dual = np.concatenate([pred_t, pred_delta], axis=0).astype(np.float32, copy=False)
+    pred = _select_gru_ri_output(pred_dual, n_ris, mode, uplink_tau_ratio)
     return _ri_to_complex(pred, n_ris)
 
 
@@ -257,6 +272,51 @@ def _predict_h_ru_plain(model, x_seq, n_ris):
         x_tensor = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
         pred = model(x_tensor)
     return _ri_to_complex(pred.squeeze(0).cpu().numpy(), n_ris)
+
+
+def _complex_nmse(est, target, eps=1e-12):
+    est_arr = np.asarray(est, dtype=np.complex64)
+    target_arr = np.asarray(target, dtype=np.complex64)
+    err_power = float(np.linalg.norm(est_arr - target_arr) ** 2)
+    ref_power = float(np.linalg.norm(target_arr) ** 2)
+    return err_power / (ref_power + float(eps))
+
+
+def _format_complex_matrix_for_log(vec_complex):
+    mat = np.asarray(vec_complex, dtype=np.complex64).reshape(1, -1)
+    return np.array2string(
+        np.round(mat, 4),
+        precision=4,
+        separator=", ",
+        suppress_small=False,
+        threshold=1000000,
+        max_line_width=200,
+    )
+
+
+def _log_gru_dual_head_debug(logger, round_idx, user_idx, pred_dual_ri, target_dual_ri, n_ris, loss_t, loss_delta):
+    pred_t_ri, pred_delta_ri = _split_gru_dual_ri(pred_dual_ri, n_ris)
+    target_t_ri, target_delta_ri = _split_gru_dual_ri(target_dual_ri, n_ris)
+    pred_t = _ri_to_complex(pred_t_ri, n_ris)
+    pred_delta = _ri_to_complex(pred_delta_ri, n_ris)
+    target_t = _ri_to_complex(target_t_ri, n_ris)
+    target_delta = _ri_to_complex(target_delta_ri, n_ris)
+    total_loss = None
+    if (loss_t is not None) and (loss_delta is not None):
+        total_loss = float(loss_t) + float(loss_delta)
+
+    loss_t_text = "n/a" if loss_t is None else f"{float(loss_t):.6f}"
+    loss_delta_text = "n/a" if loss_delta is None else f"{float(loss_delta):.6f}"
+    total_loss_text = "n/a" if total_loss is None else f"{total_loss:.6f}"
+    prefix = f"Round {round_idx} User {user_idx + 1} GRU"
+    logger.info(
+        f"{prefix} loss detail -> total={total_loss_text}, "
+        f"t={loss_t_text}, delta={loss_delta_text}"
+    )
+    logger.info(f"{prefix} target t matrix:\n{_format_complex_matrix_for_log(target_t)}")
+    logger.info(f"{prefix} pred t matrix:\n{_format_complex_matrix_for_log(pred_t)}")
+    logger.info(f"{prefix} target delta matrix:\n{_format_complex_matrix_for_log(target_delta)}")
+    logger.info(f"{prefix} pred delta matrix:\n{_format_complex_matrix_for_log(pred_delta)}")
 
 
 def _flatten_head_state(head_state):
@@ -424,6 +484,7 @@ def main():
     if debug_head_plot_every <= 0:
         debug_head_plot_every = 10
     debug_head_plot_root = str(getattr(config, "reptile_head_debug_root", "debug"))
+    debug_gru_dual_target_log_enabled = bool(getattr(config, "enable_gru_dual_target_debug_log", False))
     debug_gru_state_plot_enabled = bool(getattr(config, "enable_gru_state_diff_debug_plot", False))
     debug_gru_state_plot_every = int(getattr(config, "gru_state_diff_debug_every", 10))
     if debug_gru_state_plot_every <= 0:
@@ -465,16 +526,9 @@ def main():
     if direct_on == 0:
         logger.info("Direct link disabled.")
 
-    # Per-user pilot observation noise (SNR heterogeneity)
-    if config.use_user_pilot_snr_hetero:
-        snr_pilot_db = np.random.uniform(config.pilot_snr_dB_min, config.pilot_snr_dB_max,
-                                         size=(config.num_users,)).astype(float)
-    else:
-        snr_pilot_db = np.full((config.num_users,), float(config.pilot_SNR_dB), dtype=float)
-
-    pilot_noise_std_k = np.power(10.0, -snr_pilot_db / 20.0)  # amplitude std
-    logger.info(
-        f"Pilot SNR_dB per user: min={snr_pilot_db.min():.2f}, mean={snr_pilot_db.mean():.2f}, max={snr_pilot_db.max():.2f}")
+    pilot_snr_db = float(config.pilot_SNR_dB)
+    pilot_noise_std = float(np.power(10.0, -pilot_snr_db / 20.0))
+    logger.info(f"Pilot SNR_dB: {pilot_snr_db:.2f}")
 
     h_BUs = None
     if config.use_synthetic_data:
@@ -511,21 +565,37 @@ def main():
             h_BUs = (h_BUs.T * (np.sqrt(pl_direct) / ref)).T.astype(np.complex64)
 
     else:
-        H_BR, h_RUs_static, h_BUs_static = deepmimo.load_data(config.deepmimo_path, num_users=config.num_users)
+        H_BR, h_RUs_static, h_BUs_static = RISdata.load_data(
+            config.risdata_root,
+            num_users=config.num_users,
+            num_bs_antennas=config.num_bs_antennas,
+            subset=str(getattr(config, "risdata_subset", "specular")),
+            result_key=str(getattr(config, "risdata_result_key", "rand")),
+            reference_key=str(getattr(config, "risdata_reference_key", "RISallOff")),
+            freq_hz=float(getattr(config, "risdata_freq_hz", 5.375e9)),
+            freq_tol_hz=float(getattr(config, "risdata_freq_tol_hz", 30e6)),
+            max_pattern_samples=getattr(config, "risdata_max_pattern_samples", None),
+            min_snr_db=getattr(config, "risdata_min_snr_db", None),
+        )
 
-        # Use initial loaded channels and simulate variation via AR(1)
+        # Use the loaded static measurement-derived channels and simulate variation via AR(1).
         H_BR = H_BR.astype(np.complex64)
         if h_RUs_static.ndim == 2:
             h_RUs = h_RUs_static.astype(np.complex64)  # (K, N)
         else:
-            # If dataset provided multiple time snapshots, take first for initial
             h_RUs = h_RUs_static[:, 0, :].astype(np.complex64)
+        if int(config.num_ris_elements) != int(h_RUs.shape[1]):
+            logger.info(
+                "RISdata adapter overrides num_ris_elements from "
+                f"{int(config.num_ris_elements)} to {int(h_RUs.shape[1])} based on measurement patterns."
+            )
+            config.num_ris_elements = int(h_RUs.shape[1])
 
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
         theta_ota = np.ones(config.num_ris_elements, dtype=np.complex64)
         if direct_on == 1:
             if h_BUs_static is None:
-                logger.info("Direct link enabled but h_BU not found in dataset; using synthetic BS-UE channels.")
+                logger.info("Direct link enabled but RISdata adapter has no h_BU; using synthetic BS-UE channels.")
                 h_BUs = (np.random.randn(config.num_users, config.num_bs_antennas) +
                          1j * np.random.randn(config.num_users, config.num_bs_antennas)) / np.sqrt(2)
             else:
@@ -542,7 +612,7 @@ def main():
     # Actually, each pilot observation is complex, we consider 2 channels (real & imag)
     obs_dim = config.num_pilots
     # Single-horizon CSI target is RIS-user CSI h_RU (real-imag stacked).
-    # The GRU predicts both t and t+1, so its head output dimension is doubled internally.
+    # The GRU predicts both t and delta=(t+1)-t, so its head output dimension is doubled internally.
     output_dim = 2 * config.num_ris_elements
     gru_csi_target_mode = _parse_gru_target_mode(config.gru_csi_target_mode)
     uplink_tau_ratio = float(getattr(config, "uplink_tau_ratio", 0.5))
@@ -594,7 +664,7 @@ def main():
         f"GRU context mode={gru_context_mode}, W={W}"
     )
     logger.info(f"OA optimizer mode={oa_optimizer_mode}")
-    logger.info(f"GRU CSI output selection mode={gru_csi_target_mode} (dual-head supervised on t and t+1)")
+    logger.info(f"GRU CSI output selection mode={gru_csi_target_mode} (dual-head supervised on t and delta=(t+1)-t)")
     if use_uplink_linear:
         logger.info(f"GRU uplink interpolation ratio rho=tau/delta={uplink_tau_ratio:.3f}")
     logger.info("CNN-arch/CNN-base CSI target mode=t")
@@ -757,7 +827,7 @@ def main():
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
         local_data_stateful = [[] for _ in range(config.num_users)] if use_persistent_hidden_state else None
-        local_data_arch = [] if enable_cnn_arch_ablation else None
+        local_data_arch = [None for _ in range(config.num_users)] if enable_cnn_arch_ablation else None
         local_data_baseline = [None for _ in range(config.num_users)] if enable_cnn_baseline else None
         for k in range(config.num_users):
             # Pilot signals for user k
@@ -766,6 +836,7 @@ def main():
                 seg_count = max(1, int(round(float(user_n_k_target[k]))))
                 h_ru_seg = h_RUs[k].copy()
                 seq_samples = []
+                arch_seq_samples = [] if enable_cnn_arch_ablation else None
                 baseline_seq_samples = [] if enable_cnn_baseline else None
                 alpha_last = 0.0
                 alpha_tau_last = 0.0
@@ -776,7 +847,7 @@ def main():
                         h_ru_seg,
                         f_beam,
                         theta_pilot,
-                        noise_std=float(pilot_noise_std_k[k]),
+                        noise_std=pilot_noise_std,
                         h_BU=h_BU_k,
                         link_switch=link_switch,
                     )
@@ -804,13 +875,35 @@ def main():
                     y = _build_gru_dual_target(h_ru_seg, h_next_seg)
                     seq_samples.append((X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False)))
 
+                    if enable_cnn_arch_ablation:
+                        Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
+                            H_BR,
+                            h_ru_seg,
+                            f_beam_arch,
+                            theta_pilot,
+                            noise_std=pilot_noise_std,
+                            h_BU=h_BU_k,
+                            link_switch=link_switch,
+                        )
+                        obs_real_arch = np.real(Y_pilot_arch)
+                        obs_imag_arch = np.imag(Y_pilot_arch)
+                        obs_step_arch = np.stack([obs_real_arch, obs_imag_arch], axis=0).astype(np.float32)
+                        X_seq_arch = obs_step_arch[None, :, :]
+                        y_arch = _complex_to_ri(h_ru_seg)
+                        arch_seq_samples.append(
+                            (
+                                X_seq_arch.astype(np.float32, copy=False),
+                                y_arch.astype(np.float32, copy=False),
+                            )
+                        )
+
                     if enable_cnn_baseline:
                         Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
                             H_BR,
                             h_ru_seg,
                             f_beam_baseline,
                             theta_pilot,
-                            noise_std=float(pilot_noise_std_k[k]),
+                            noise_std=pilot_noise_std,
                             h_BU=h_BU_k,
                             link_switch=link_switch,
                         )
@@ -833,6 +926,8 @@ def main():
 
                 local_data_stateful[k] = seq_samples
                 local_data.append(seq_samples[-1])
+                if enable_cnn_arch_ablation:
+                    local_data_arch[k] = arch_seq_samples
                 if enable_cnn_baseline:
                     local_data_baseline[k] = baseline_seq_samples
                 if use_uplink_linear:
@@ -843,7 +938,7 @@ def main():
             else:
                 Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam, theta_pilot,
-                    noise_std=float(pilot_noise_std_k[k]),
+                    noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
@@ -874,10 +969,10 @@ def main():
             if (not use_persistent_hidden_state) and use_time_window and W > 1 and round_idx <= 3 and k == 0:
                 logger.info(f"Example X_seq shape for user1: {sample[0].shape}")  # (W,2,P)
 
-            if enable_cnn_arch_ablation:
+            if enable_cnn_arch_ablation and (not use_persistent_hidden_state):
                 Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_arch, theta_pilot,
-                    noise_std=float(pilot_noise_std_k[k]),
+                    noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
@@ -904,11 +999,11 @@ def main():
                     X_seq_arch.astype(np.float32, copy=False),
                     y_arch.astype(np.float32, copy=False),
                 )
-                local_data_arch.append(sample_arch)
+                local_data_arch[k] = sample_arch
             if enable_cnn_baseline and (not use_persistent_hidden_state):
                 Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
-                    noise_std=float(pilot_noise_std_k[k]),
+                    noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
@@ -929,6 +1024,8 @@ def main():
         # Local training on each user's data
         local_models = []
         losses = []
+        gru_losses_t = []
+        gru_losses_delta = []
         local_models_arch = [] if enable_cnn_arch_ablation else None
         losses_arch = [] if enable_cnn_arch_ablation else None
         local_models_baseline = [] if enable_cnn_baseline else None
@@ -948,6 +1045,10 @@ def main():
             loss_arch = None
             loss_baseline = None
             samples_used_k = 1
+            gru_loss_t = None
+            gru_loss_delta = None
+            pred_dual_for_log = None
+            target_dual_for_log = None
 
             # Model for user k from global weights
             local_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
@@ -967,6 +1068,9 @@ def main():
                     seq_k,
                     hidden_state=hidden_prev,
                 )
+                gru_stats = dict(getattr(trainer, "last_loss_stats", {}))
+                gru_loss_t = gru_stats.get("loss_t")
+                gru_loss_delta = gru_stats.get("loss_delta")
                 samples_used_k = max(1, len(seq_k))
                 user_hidden_states[k] = hidden_next
                 state_fast_x_round[k] = compute_hidden_drift_ratio(
@@ -984,37 +1088,57 @@ def main():
                     gru_state_delta_vectors[k] = (vec_next - vec_prev).numpy()
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
+                target_dual_for_log = np.asarray(sample_k[1], dtype=np.float32)
                 if pred_last is not None:
+                    pred_dual_for_log = pred_last.numpy().astype(np.float32, copy=False)
                     pred_selected = _select_gru_ri_output(
-                        pred_last.numpy(),
+                        pred_dual_for_log,
                         config.num_ris_elements,
                         gru_csi_target_mode,
                         uplink_tau_ratio,
                     )
                     h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
                 else:
-                    h_RUs_est[k] = _predict_h_ru_gru(
+                    pred_t_ri, pred_delta_ri = _predict_gru_dual_ri(
                         local_model,
                         sample_k[0],
+                        hidden_state=hidden_prev,
+                    )
+                    pred_dual_for_log = np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False)
+                    pred_selected = _select_gru_ri_output(
+                        pred_dual_for_log,
                         config.num_ris_elements,
                         gru_csi_target_mode,
                         uplink_tau_ratio,
-                        hidden_state=hidden_prev,
                     )
+                    h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
             else:
                 data_k = [local_data[k]]
                 samples_used_k = max(1, len(data_k))
                 local_model, loss = trainer.train(local_model, data_k)
-                h_RUs_est[k] = _predict_h_ru_gru(
+                gru_stats = dict(getattr(trainer, "last_loss_stats", {}))
+                gru_loss_t = gru_stats.get("loss_t")
+                gru_loss_delta = gru_stats.get("loss_delta")
+                target_dual_for_log = np.asarray(local_data[k][1], dtype=np.float32)
+                pred_t_ri, pred_delta_ri = _predict_gru_dual_ri(
                     local_model,
                     local_data[k][0],
+                    hidden_state=None,
+                )
+                pred_dual_for_log = np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False)
+                pred_selected = _select_gru_ri_output(
+                    pred_dual_for_log,
                     config.num_ris_elements,
                     gru_csi_target_mode,
                     uplink_tau_ratio,
-                    hidden_state=None,
                 )
+                h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
             user_sample_count_round[k] = float(samples_used_k)
             losses.append(loss if loss is not None else 0.0)
+            if gru_loss_t is not None:
+                gru_losses_t.append(float(gru_loss_t))
+            if gru_loss_delta is not None:
+                gru_losses_delta.append(float(gru_loss_delta))
             local_models.append(local_model)
             # cache back the personalized head for user k
             user_head_states[k] = {
@@ -1049,13 +1173,16 @@ def main():
                 for hk, hv in user_head_states_arch[k].items():
                     state_arch[hk] = hv.clone()
                 local_model_arch.load_state_dict(state_arch)
-                data_k_arch = [local_data_arch[k]]
+                if use_persistent_hidden_state:
+                    data_k_arch = local_data_arch[k]
+                else:
+                    data_k_arch = [local_data_arch[k]]
                 local_model_arch, loss_arch = trainer.train(local_model_arch, data_k_arch)
                 losses_arch.append(loss_arch if loss_arch is not None else 0.0)
                 local_models_arch.append(local_model_arch)
                 h_RUs_est_arch[k] = _predict_h_ru_plain(
                     local_model_arch,
-                    local_data_arch[k][0],
+                    data_k_arch[-1][0],
                     config.num_ris_elements,
                 )
                 user_head_states_arch[k] = {
@@ -1088,7 +1215,13 @@ def main():
 
             loss_parts = []
             if loss is not None:
-                loss_parts.append(f"GRU: \033[34m{loss:.4f}\033[0m")
+                if (gru_loss_t is not None) and (gru_loss_delta is not None):
+                    loss_parts.append(
+                        "GRU(total/t/delta): "
+                        f"\033[34m{loss:.4f}/{gru_loss_t:.4f}/{gru_loss_delta:.4f}\033[0m"
+                    )
+                else:
+                    loss_parts.append(f"GRU: \033[34m{loss:.4f}\033[0m")
             if enable_cnn_arch_ablation and (loss_arch is not None):
                 loss_parts.append(f"CNN-arch: \033[35m{loss_arch:.4f}\033[0m")
             if enable_cnn_baseline and (loss_baseline is not None):
@@ -1097,6 +1230,21 @@ def main():
                 logger.info(f"User {k + 1} local loss -> " + ", ".join(loss_parts))
             else:
                 logger.info(f"User {k + 1} local training done.")
+            if (
+                debug_gru_dual_target_log_enabled
+                and (pred_dual_for_log is not None)
+                and (target_dual_for_log is not None)
+            ):
+                _log_gru_dual_head_debug(
+                    logger,
+                    round_idx,
+                    k,
+                    pred_dual_for_log,
+                    target_dual_for_log,
+                    config.num_ris_elements,
+                    gru_loss_t,
+                    gru_loss_delta,
+                )
 
         if losses:
             round_loss_parts = [f"Round {round_idx} mean local loss -> GRU: {np.mean(losses):.4f}"]
@@ -1105,6 +1253,32 @@ def main():
             if enable_cnn_baseline and losses_baseline:
                 round_loss_parts.append(f"CNN-base: {np.mean(losses_baseline):.4f}")
             logger.info(", ".join(round_loss_parts))
+            if gru_losses_t and gru_losses_delta:
+                logger.info(
+                    f"Round {round_idx} GRU dual-head local loss -> "
+                    f"GRU_t: {np.mean(gru_losses_t):.4f}, "
+                    f"GRU_delta: {np.mean(gru_losses_delta):.4f}, "
+                    f"GRU_total: {np.mean(losses):.4f}"
+                )
+        if use_uplink_linear and (h_RUs_uplink is not None):
+            uplink_nmse_gru = _complex_nmse(h_RUs_est, h_RUs_uplink)
+            logger.info(_colorize_branch_line("GRU", f"GRU uplink_true_NMSE={_highlight_metric_value(uplink_nmse_gru, 'GRU')}"))
+            if enable_cnn_arch_ablation and (h_RUs_est_arch is not None):
+                uplink_nmse_arch = _complex_nmse(h_RUs_est_arch, h_RUs_uplink)
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-arch",
+                        f"CNN-arch uplink_true_NMSE={_highlight_metric_value(uplink_nmse_arch, 'CNN-arch')}",
+                    )
+                )
+            if enable_cnn_baseline and (h_RUs_est_baseline is not None):
+                uplink_nmse_baseline = _complex_nmse(h_RUs_est_baseline, h_RUs_uplink)
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-base",
+                        f"CNN-base uplink_true_NMSE={_highlight_metric_value(uplink_nmse_baseline, 'CNN-base')}",
+                    )
+                )
 
         state_fast_x = state_fast_x_round.astype(np.float32, copy=False)
         if oa_optimizer_mode == "state_aware":

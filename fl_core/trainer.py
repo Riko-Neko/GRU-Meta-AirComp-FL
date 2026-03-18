@@ -13,6 +13,7 @@ class GRUTrainer:
         self.batch_size = batch_size
         self.device = device or torch.device('cpu')
         self.criterion = nn.MSELoss()
+        self.last_loss_stats = {}
 
     def _compute_loss_and_pack(self, outputs, targets):
         """
@@ -22,12 +23,24 @@ class GRUTrainer:
           packed_outputs: tensor shaped like targets for downstream logging/prediction
         """
         if isinstance(outputs, tuple):
-            pred_t, pred_t1 = outputs
-            target_t, target_t1 = torch.chunk(targets, 2, dim=-1)
-            loss = self.criterion(pred_t, target_t) + self.criterion(pred_t1, target_t1)
-            packed_outputs = torch.cat([pred_t, pred_t1], dim=-1)
+            pred_t, pred_delta = outputs
+            target_t, target_delta = torch.chunk(targets, 2, dim=-1)
+            loss_t = self.criterion(pred_t, target_t)
+            loss_delta = self.criterion(pred_delta, target_delta)
+            loss = loss_t + loss_delta
+            packed_outputs = torch.cat([pred_t, pred_delta], dim=-1)
+            self.last_loss_stats = {
+                "loss": float(loss.detach().item()),
+                "loss_t": float(loss_t.detach().item()),
+                "loss_delta": float(loss_delta.detach().item()),
+            }
             return loss, packed_outputs
         loss = self.criterion(outputs, targets)
+        self.last_loss_stats = {
+            "loss": float(loss.detach().item()),
+            "loss_t": None,
+            "loss_delta": None,
+        }
         return loss, outputs
     
     def train(self, model, data):
@@ -80,8 +93,7 @@ class GRUTrainer:
                 X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
                 y_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).unsqueeze(0)
                 pred = model(X_tensor)
-                _, pred_packed = self._compute_loss_and_pack(pred, y_tensor)
-                loss = criterion(pred_packed, y_tensor)
+                loss, _ = self._compute_loss_and_pack(pred, y_tensor)
                 total_loss += loss.item()
                 count += 1
         mse = total_loss / count if count > 0 else 0.0
@@ -134,9 +146,10 @@ class GRUTrainer:
         model.train()
         optimizer = optim.Adam(model.parameters(), lr=self.learning_rate)
 
-        h_prev = None
+        h_init = None
         if hidden_state is not None:
-            h_prev = hidden_state.detach().to(self.device)
+            h_init = hidden_state.detach().to(self.device)
+        h_prev = h_init
 
         final_loss = None
         last_pred = None
@@ -154,8 +167,21 @@ class GRUTrainer:
                 h_prev = h_next.detach()
                 last_pred = packed_outputs.detach().cpu().squeeze(0).float()
 
-        if h_prev is None:
+        model.eval()
+        with torch.no_grad():
+            h_eval = None if h_init is None else h_init.detach().clone()
+            for X, _ in samples:
+                X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device).unsqueeze(0)
+                outputs, h_eval = model(X_tensor, h0=h_eval, return_hidden=True)
+                if isinstance(outputs, tuple):
+                    packed_outputs = torch.cat([outputs[0], outputs[1]], dim=-1)
+                else:
+                    packed_outputs = outputs
+                last_pred = packed_outputs.detach().cpu().squeeze(0).float()
+        model.train()
+
+        if h_eval is None:
             hidden_next_cpu = None
         else:
-            hidden_next_cpu = h_prev.detach().cpu()
+            hidden_next_cpu = h_eval.detach().cpu()
         return model, final_loss, hidden_next_cpu, last_pred

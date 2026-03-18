@@ -7,11 +7,13 @@ from typing import Dict, Optional, Tuple
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 ROUND_RE = re.compile(r"Round\s+(\d+)")
 MEAN_LOCAL_LOSS_RE = re.compile(r"Round\s+(\d+)\s+mean local loss\s*->\s*(.+)$")
+GRU_DUAL_HEAD_LOSS_RE = re.compile(r"Round\s+(\d+)\s+GRU dual-head local loss\s*->\s*(.+)$")
 GLOBAL_UPDATE_RE = re.compile(
     r"(GRU|CNN-arch|CNN-base)\s+global(?:\s+backbone)?\s+update norm:\s*([0-9eE+.\-]+)"
 )
 AGG_NMSE_RE = re.compile(r"agg_NMSE=([0-9eE+.\-]+)")
 PROXY_NMSE_RE = re.compile(r"proxy_NMSE=([0-9eE+.\-]+)")
+UPLINK_TRUE_NMSE_RE = re.compile(r"uplink_true_NMSE=([0-9eE+.\-]+)")
 MODEL_ORDER = ("GRU", "CNN-arch", "CNN-base", "Oracle-true")
 MODEL_COLORS = {"GRU": "#1f77b4", "CNN-arch": "#d627aa", "CNN-base": "#17becf", "Oracle-true": "#ff7f0e"}
 
@@ -50,6 +52,16 @@ def _model_from_proxy_line(msg: str) -> Optional[str]:
     return None
 
 
+def _model_from_uplink_line(msg: str) -> Optional[str]:
+    if msg.startswith("GRU uplink_true_NMSE="):
+        return "GRU"
+    if msg.startswith("CNN-arch uplink_true_NMSE="):
+        return "CNN-arch"
+    if msg.startswith("CNN-base uplink_true_NMSE="):
+        return "CNN-base"
+    return None
+
+
 def _append_metric(
     store: Dict[str, Dict[int, float]],
     model: str,
@@ -66,6 +78,7 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
     round_update_norm: Dict[str, Dict[int, float]] = {}
     round_agg_nmse: Dict[str, Dict[int, float]] = {}
     round_proxy_nmse: Dict[str, Dict[int, float]] = {}
+    round_uplink_true_nmse: Dict[str, Dict[int, float]] = {}
     current_round: Optional[int] = None
     pending_proxy_model: Optional[str] = None
 
@@ -94,6 +107,25 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
                     _append_metric(round_local_loss, model, r, v)
                 continue
 
+            m_gru_dual = GRU_DUAL_HEAD_LOSS_RE.search(msg)
+            if m_gru_dual:
+                r = int(m_gru_dual.group(1))
+                parts = [p.strip() for p in m_gru_dual.group(2).split(",")]
+                for part in parts:
+                    if ":" not in part:
+                        continue
+                    key, value = part.split(":", 1)
+                    if key.strip() != "GRU_t":
+                        continue
+                    try:
+                        v_t = float(value.strip())
+                    except ValueError:
+                        continue
+                    # For plotting GRU loss, prefer t-head loss over total dual-head loss.
+                    _append_metric(round_local_loss, "GRU", r, v_t)
+                    break
+                continue
+
             m_update = GLOBAL_UPDATE_RE.search(msg)
             if m_update:
                 _append_metric(round_update_norm, m_update.group(1), current_round, float(m_update.group(2)))
@@ -118,11 +150,19 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
                     pending_proxy_model = None
                 continue
 
+            model_uplink = _model_from_uplink_line(msg)
+            if model_uplink is not None:
+                m_uplink = UPLINK_TRUE_NMSE_RE.search(msg)
+                if m_uplink:
+                    _append_metric(round_uplink_true_nmse, model_uplink, current_round, float(m_uplink.group(1)))
+                continue
+
     return {
         "Round Mean Local Loss": round_local_loss,
         "Global Update Norm": round_update_norm,
         "AirComp Aggregation NMSE": round_agg_nmse,
         "Proxy NMSE After Optimization": round_proxy_nmse,
+        "Uplink True NMSE": round_uplink_true_nmse,
     }
 
 
@@ -261,18 +301,20 @@ def _svg_panel(
 
 
 def _render_svg(metrics: Dict[str, Dict[str, Dict[int, float]]], log_stem: str, out_path: str) -> str:
-    width, height = 1420, 950
+    width, height = 1420, 1400
     panels: Tuple[Tuple[int, int, int, int], ...] = (
         (20, 42, 680, 420),
         (720, 42, 680, 420),
         (20, 500, 680, 420),
         (720, 500, 680, 420),
+        (20, 958, 680, 420),
     )
     titles = (
         "Round Mean Local Loss",
         "Global Update Norm",
         "AirComp Aggregation NMSE",
         "Proxy NMSE After Optimization",
+        "Uplink True NMSE",
     )
 
     chunks = [
@@ -297,15 +339,18 @@ def _render_matplotlib(metrics: Dict[str, Dict[str, Dict[int, float]]], log_stem
     except Exception:
         return None
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 13), constrained_layout=True)
     titles = (
         "Round Mean Local Loss",
         "Global Update Norm",
         "AirComp Aggregation NMSE",
         "Proxy NMSE After Optimization",
+        "Uplink True NMSE",
     )
     for ax, title in zip(axes.flat, titles):
         _plot_metric_matplotlib(ax, metrics.get(title, {}), title, ylog=True)
+    for ax in axes.flat[len(titles):]:
+        ax.axis("off")
     fig.suptitle(log_stem, fontsize=11)
     fig.savefig(out_path, dpi=160)
     plt.close(fig)

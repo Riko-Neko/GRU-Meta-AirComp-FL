@@ -6,8 +6,138 @@ import numpy as np
 from scipy.io import loadmat
 
 
-def load_data(file_path, num_users=None):
-    return None, None, None
+def _pattern_to_row(ris_pattern: Any) -> Optional[np.ndarray]:
+    if ris_pattern is None:
+        return None
+    arr = np.asarray(ris_pattern)
+    if arr.size == 0:
+        return None
+    return arr.reshape(-1).astype(np.float32, copy=False)
+
+
+def _selected_trace_value(sample: Dict[str, Any]) -> Optional[np.complex64]:
+    trace = sample.get("s21_trace")
+    freq_idx = sample.get("freq_idx")
+    if trace is None or freq_idx is None:
+        return None
+
+    trace_arr = np.asarray(trace).reshape(-1)
+    idx = int(freq_idx)
+    if idx < 0 or idx >= trace_arr.size:
+        return None
+
+    value = trace_arr[idx]
+    reference = sample.get("reference_trace")
+    if reference is not None:
+        ref_arr = np.asarray(reference).reshape(-1)
+        if 0 <= idx < ref_arr.size:
+            value = value - ref_arr[idx]
+    return np.complex64(value)
+
+
+def _estimate_effective_channel(samples: Sequence[Dict[str, Any]]) -> Optional[np.ndarray]:
+    rows: List[np.ndarray] = []
+    values: List[np.complex64] = []
+
+    for sample in samples:
+        row = _pattern_to_row(sample.get("ris_pattern"))
+        value = _selected_trace_value(sample)
+        if row is None or value is None:
+            continue
+        rows.append(row)
+        values.append(value)
+
+    if not rows:
+        return None
+
+    n_elem = rows[0].size
+    if any(row.size != n_elem for row in rows):
+        return None
+
+    design = np.stack(rows, axis=0).astype(np.float32, copy=False)
+    response = np.asarray(values, dtype=np.complex64).reshape(-1)
+    channel, _, _, _ = np.linalg.lstsq(design, response, rcond=1e-6)
+    return channel.astype(np.complex64, copy=False)
+
+
+def load_data(
+        file_path,
+        num_users=None,
+        *,
+        num_bs_antennas=32,
+        subset="specular",
+        result_key="rand",
+        reference_key="RISallOff",
+        freq_hz=5.375e9,
+        freq_tol_hz=30e6,
+        max_pattern_samples=None,
+        min_snr_db=None,
+):
+    """
+    Adapter used by `main.py`.
+
+    The RIS-S21 dataset does not provide a decomposed `(H_BR, h_RU, h_BU)` tuple directly.
+    This wrapper reconstructs one effective reflection-channel vector per geometry by solving
+    a least-squares inverse problem from `(RIS pattern, measured S21)` pairs at the chosen
+    frequency bin, and then packs the result into the existing simulation interface:
+
+    - `H_BR`: deterministic placeholder with unit gain on the first BS antenna
+    - `h_RUs_static`: per-user effective reflection channels recovered from measurements
+    - `h_BUs_static`: `None` (direct path is not available from this dataset wrapper)
+    """
+    dataset = load_ris_s21_dataset(
+        root_dir=file_path,
+        subset=subset,
+        result_key=result_key,
+        reference_key=reference_key,
+        freq_hz=freq_hz,
+        freq_tol_hz=freq_tol_hz,
+        max_pattern_samples=max_pattern_samples,
+        min_snr_db=min_snr_db,
+    )
+
+    grouped: Dict[Any, List[Dict[str, Any]]] = {}
+    for sample in dataset["samples"]:
+        grouped.setdefault(sample["geometry_id"], []).append(sample)
+
+    geometry_ids = sorted(grouped.keys(), key=lambda x: str(x))
+    effective_channels: List[np.ndarray] = []
+    kept_geometry_ids: List[Any] = []
+    for geometry_id in geometry_ids:
+        channel = _estimate_effective_channel(grouped[geometry_id])
+        if channel is None:
+            continue
+        effective_channels.append(channel)
+        kept_geometry_ids.append(geometry_id)
+
+    if not effective_channels:
+        raise ValueError("RISdata.load_data could not reconstruct any effective reflection channels.")
+
+    if num_users is not None:
+        k = int(num_users)
+        if k <= 0:
+            raise ValueError(f"num_users must be positive, got {num_users}")
+        if len(effective_channels) < k:
+            raise ValueError(
+                f"RISdata provides only {len(effective_channels)} valid geometries, "
+                f"which is fewer than requested num_users={k}."
+            )
+        effective_channels = effective_channels[:k]
+        kept_geometry_ids = kept_geometry_ids[:k]
+
+    h_RUs_static = np.stack(effective_channels, axis=0).astype(np.complex64, copy=False)
+    num_ris_elements = int(h_RUs_static.shape[1])
+    num_bs_antennas = int(num_bs_antennas)
+    if num_bs_antennas <= 0:
+        raise ValueError(f"num_bs_antennas must be positive, got {num_bs_antennas}")
+
+    # Use a deterministic placeholder BS-RIS matrix so the existing simulator can reuse
+    # the measured effective reflection channel as `h_RU`.
+    H_BR = np.zeros((num_ris_elements, num_bs_antennas), dtype=np.complex64)
+    H_BR[:, 0] = 1.0 + 0.0j
+
+    _ = kept_geometry_ids  # retained for debugging convenience when stepping through the loader
+    return H_BR, h_RUs_static, None
 
 
 @dataclass

@@ -6,8 +6,15 @@ import math
 # Configuration parameters for the simulation
 class Config:
     # Data and environment settings
-    use_synthetic_data = True  # whether to generate synthetic data (if False, use DeepMIMO data)
-    deepmimo_path = "DeepMIMO_O1.npy"  # path to DeepMIMO dataset file (if use_synthetic_data is False)
+    use_synthetic_data = True  # whether to generate synthetic data (if False, use RIS-S21 measurement data)
+    risdata_root = "dataset"  # root dir of RIS-S21 dataset when use_synthetic_data is False
+    risdata_subset = "specular"
+    risdata_result_key = "rand"
+    risdata_reference_key = "RISallOff"
+    risdata_freq_hz = 5.375e9
+    risdata_freq_tol_hz = 30e6
+    risdata_max_pattern_samples = None
+    risdata_min_snr_db = None
     num_users = 10  # number of users (K)
     num_bs_antennas = 32  # number of BS antennas (M)
     num_ris_elements = 64  # number of RIS elements (N)
@@ -27,7 +34,7 @@ class Config:
     link_switch = [1, 0]
 
     # channel settings (RIS->UE link, RU)
-    channel_alpha = 0.75  # AR(1)
+    channel_alpha = 0.3  # AR(1)
     use_dynamic_alpha = False
     dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
     alpha_min = 0.50
@@ -38,18 +45,15 @@ class Config:
 
     # per-user heterogeneity
     # channel dynamic (alpha_k heterogeneity)
-    use_user_alpha_hetero = True
+    use_user_alpha_hetero = False
     alpha_user_min = 0.60
     alpha_user_max = 0.98
     # Pilot observation noise
-    use_user_pilot_snr_hetero = False
     pilot_SNR_dB = 20
-    pilot_snr_dB_min = 10
-    pilot_snr_dB_max = 30
 
     # GRU context settings
     gru_context_mode = "persistent_hidden"  # "persistent_hidden" | "time_window"
-    gru_csi_target_mode = "t+1"  # GRU output selection: "t" | "t+1" | "uplink_linear"
+    gru_csi_target_mode = "uplink_linear"  # GRU output selection: "t" | "t+1" | "uplink_linear"
     uplink_tau_ratio = 0.5  # tau / delta_t for uplink instant, used only when gru_csi_target_mode="uplink_linear"
     window_length = 8  # time window length（5~20）
     window_pad_value = 0.0  # padding value in initial stage
@@ -64,14 +68,14 @@ class Config:
     cnn_baseline_hidden_size = 32
 
     # Pure architecture ablation (replace GRU backbone with non-stateful CNN)
-    enable_cnn_arch_ablation = False
+    enable_cnn_arch_ablation = True
     cnn_arch_conv_filters = 8
     cnn_arch_conv_kernel = 3
     cnn_arch_hidden_size = 32
     cnn_arch_pool_mode = "last"  # "last" or "mean"
 
     # Federated learning settings
-    num_rounds = 50  # number of communication rounds
+    num_rounds = 50 # number of communication rounds
     local_epochs = 3  # local update epochs per round (per user)
     local_lr = 1e-3  # learning rate for local training
     batch_size = 8  # batch size for local training (None means use all data per epoch)
@@ -93,7 +97,7 @@ class Config:
     user_data_partition_mode = "grouped"  # "equal" | "grouped"
     user_data_size_equal = 10
     user_group_ratios = [0.3, 0.4, 0.3]  # small/medium/large user fractions, auto-normalized
-    user_group_data_sizes = [5, 10, 20]  # small/medium/large n_k for persistent segments
+    user_group_data_sizes = [1, 10, 50]  # small/medium/large n_k for persistent segments
 
     # OA optimizer mode
     oa_optimizer_mode = "legacy"  # "legacy" | "state_aware"
@@ -121,6 +125,7 @@ class Config:
     enable_reptile_head_debug_plot = False
     reptile_head_debug_every = 10  # save one projection figure every N rounds
     reptile_head_debug_root = "debug"
+    enable_gru_dual_target_debug_log = False
     enable_gru_state_diff_debug_plot = False
     gru_state_diff_debug_every = 10  # save one GRU state-diff figure every N rounds
 
@@ -134,6 +139,7 @@ class Config:
                 "enable_reptile_head_debug_plot",
                 "reptile_head_debug_every",
                 "reptile_head_debug_root",
+                "enable_gru_dual_target_debug_log",
                 "enable_gru_state_diff_debug_plot",
                 "gru_state_diff_debug_every",
             }:

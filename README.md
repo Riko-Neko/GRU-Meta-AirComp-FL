@@ -14,10 +14,10 @@ The main branch of the code uses:
 
 The default and recommended path is the synthetic-data simulation driven by `main.py` and `utils/config.py`.
 
-The repository also contains a measurement-data loader utility in `data/RISdata.py`, but the non-synthetic branch in `main.py` still has legacy dataset-loading code and is not fully wired to that loader. In practice:
+The repository also contains a measurement-data loader utility in `data/RISdata.py`, and the non-synthetic branch in `main.py` now uses it through a lightweight adapter that reconstructs one effective reflection channel per geometry from measured RIS patterns and S21 traces. In practice:
 
 - `use_synthetic_data = True` is the path that currently matches the codebase and existing logs/figures.
-- Real-data experiments require additional integration work before they can be treated as a supported workflow.
+- `use_synthetic_data = False` uses RIS-S21 measurement data as a static channel initializer, then reuses the same AR(1)/OU temporal evolution as the synthetic branch.
 
 ## What The Project Does
 
@@ -119,6 +119,10 @@ All configuration lives in `utils/config.py`.
 ### Data and topology
 
 - `use_synthetic_data`
+- `risdata_root`
+- `risdata_subset`
+- `risdata_result_key`
+- `risdata_reference_key`
 - `num_users`
 - `num_bs_antennas`
 - `num_ris_elements`
@@ -132,7 +136,7 @@ All configuration lives in `utils/config.py`.
 - `dynamic_alpha_mode`
 - `alpha_min`, `alpha_max`, `alpha_period_rounds`
 - `use_user_alpha_hetero`
-- `use_user_pilot_snr_hetero`
+- `pilot_SNR_dB`
 
 ### GRU context and prediction target
 
@@ -170,6 +174,7 @@ All configuration lives in `utils/config.py`.
 - `enable_cnn_baseline`
 - `enable_cnn_arch_ablation`
 - `enable_reptile_head_debug_plot`
+- `enable_gru_dual_target_debug_log`
 - `enable_gru_state_diff_debug_plot`
 
 ## Outputs
@@ -200,24 +205,18 @@ This is the supported path today. `main.py` builds:
 
 ### RIS-S21 loader utility
 
-`data/RISdata.py` provides a general-purpose loader for the 2023 RIS-S21 measurement dataset and supports:
+`data/RISdata.py` provides the MATLAB loader plus the adapter used by `main.py` when `use_synthetic_data = False`. The adapter:
 
-- subset selection;
-- geometry filtering;
-- frequency-bin selection;
-- optional SNR proxy filtering.
-
-However, it is currently a utility module rather than a fully integrated `main.py` data path.
-
-### External data caveat
-
-The external-data branch in `main.py` still references a legacy `deepmimo.load_data(...)` call, while the repository no longer ships `data/deepmimo.py`. That means README guidance should treat real-data use as an extension point, not a finished workflow.
+- groups samples by geometry;
+- subtracts the chosen reference trace when available;
+- solves a least-squares inverse problem over RIS patterns to recover one effective reflection channel per geometry;
+- returns that channel to the existing FL/OTA simulation as the static initialization.
 
 ## Known Limitations
 
 - Configuration is hard-coded in `utils/config.py`; there is no CLI or experiment launcher.
 - The supported execution path is the synthetic simulation.
-- Real-data integration is incomplete and requires code changes before use.
+- The RIS-S21 path is an adapter, not a full measurement-native pipeline: after static initialization, temporal evolution is still simulated.
 - Training runs on CPU by default unless you modify the trainer/model placement.
 - `requirements.txt` does not include optional dataset-loader dependencies such as `scipy`.
 
