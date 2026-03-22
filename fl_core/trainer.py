@@ -27,7 +27,7 @@ class GRUTrainer:
             target_t, target_delta = torch.chunk(targets, 2, dim=-1)
             loss_t = self.criterion(pred_t, target_t)
             loss_delta = self.criterion(pred_delta, target_delta)
-            loss = loss_t + loss_delta
+            loss = 0.5 * (loss_t + loss_delta)
             packed_outputs = torch.cat([pred_t, pred_delta], dim=-1)
             self.last_loss_stats = {
                 "loss": float(loss.detach().item()),

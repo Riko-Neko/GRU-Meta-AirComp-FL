@@ -49,6 +49,14 @@ def _model_from_proxy_line(msg: str) -> Optional[str]:
         return "CNN-base"
     if "Optimized theta_ota:" in msg:
         return "GRU"
+    if msg.startswith("Oracle-true proxy_NMSE="):
+        return "Oracle-true"
+    if msg.startswith("CNN-arch proxy_NMSE="):
+        return "CNN-arch"
+    if msg.startswith("CNN-base proxy_NMSE="):
+        return "CNN-base"
+    if msg.startswith("GRU proxy_NMSE="):
+        return "GRU"
     return None
 
 
@@ -73,6 +81,16 @@ def _append_metric(
     store.setdefault(model, {})[round_idx] = value
 
 
+def _proxy_model_order(enable_cnn_arch: bool, enable_cnn_baseline: bool):
+    order = ["GRU"]
+    if enable_cnn_arch:
+        order.append("CNN-arch")
+    if enable_cnn_baseline:
+        order.append("CNN-base")
+    order.append("Oracle-true")
+    return order
+
+
 def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
     round_local_loss: Dict[str, Dict[int, float]] = {}
     round_update_norm: Dict[str, Dict[int, float]] = {}
@@ -81,15 +99,26 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
     round_uplink_true_nmse: Dict[str, Dict[int, float]] = {}
     current_round: Optional[int] = None
     pending_proxy_model: Optional[str] = None
+    enable_cnn_arch = False
+    enable_cnn_baseline = False
+    proxy_sequence_idx = 0
 
     with open(log_path, "r", encoding="utf-8") as f:
         for raw in f:
             line = _strip_ansi(raw.rstrip("\n"))
             msg = line.split("] ", 1)[1] if "] " in line else line
 
+            if "CNN architecture ablation enabled=True" in msg:
+                enable_cnn_arch = True
+            if "Literature CNN baseline enabled=True" in msg:
+                enable_cnn_baseline = True
+
             m_round = ROUND_RE.search(msg)
             if m_round and "Generating pilot observations" in msg:
                 current_round = int(m_round.group(1))
+
+            if "Optimizing beamforming and RIS configuration." in msg:
+                proxy_sequence_idx = 0
 
             m_mean = MEAN_LOCAL_LOSS_RE.search(msg)
             if m_mean:
@@ -145,6 +174,11 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
             m_proxy = PROXY_NMSE_RE.search(msg)
             if m_proxy:
                 target_model = model_proxy if model_proxy is not None else pending_proxy_model
+                if target_model is None and msg.startswith("proxy_NMSE="):
+                    order = _proxy_model_order(enable_cnn_arch, enable_cnn_baseline)
+                    if proxy_sequence_idx < len(order):
+                        target_model = order[proxy_sequence_idx]
+                        proxy_sequence_idx += 1
                 if target_model is not None:
                     _append_metric(round_proxy_nmse, target_model, current_round, float(m_proxy.group(1)))
                     pending_proxy_model = None

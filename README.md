@@ -17,7 +17,7 @@ The default and recommended path is the synthetic-data simulation driven by `mai
 The repository also contains a measurement-data loader utility in `data/RISdata.py`, and the non-synthetic branch in `main.py` now uses it through a lightweight adapter that reconstructs one effective reflection channel per geometry from measured RIS patterns and S21 traces. In practice:
 
 - `use_synthetic_data = True` is the path that currently matches the codebase and existing logs/figures.
-- `use_synthetic_data = False` uses RIS-S21 measurement data as a static channel initializer, then reuses the same AR(1)/OU temporal evolution as the synthetic branch.
+- `use_synthetic_data = False` uses RIS-S21 measurement data as a static channel initializer, then reuses the same mobility-driven large-scale fading plus AR(1)/OU small-scale evolution as the synthetic branch.
 
 ## What The Project Does
 
@@ -29,7 +29,7 @@ Each communication round follows this high-level loop:
 4. Aggregate only the shared backbone updates at the server, while keeping each user's prediction head local.
 5. Simulate OTA aggregation distortion when AirComp is enabled.
 6. Optimize the BS beamformer `f` and RIS phase vector `theta` for the next round.
-7. Evolve the RIS-user channels with AR(1) dynamics, optionally with user heterogeneity or time-varying alpha.
+7. Evolve user-dependent channels with explicit position updates, distance-driven path-loss, and AR(1)/OU small-scale fading.
 
 ## Main Components
 
@@ -40,7 +40,7 @@ Each communication round follows this high-level loop:
 │   └── f_theta_optim.py    # Legacy and state-aware beam/RIS optimization
 ├── data/
 │   ├── RISdata.py          # RIS-S21 measurement loader utilities
-│   ├── channel.py          # AR(1) channel evolution and alpha scheduling
+│   ├── channel.py          # Mobility-driven path-loss and AR(1)/OU small-scale evolution
 │   └── pilot_gen.py        # Pilot generation and observation simulation
 ├── fl_core/
 │   ├── agg.py              # FedAvg-style aggregation helpers
@@ -131,11 +131,16 @@ All configuration lives in `utils/config.py`.
 
 ### Channel dynamics
 
-- `channel_alpha`
-- `use_dynamic_alpha`
-- `dynamic_alpha_mode`
-- `alpha_min`, `alpha_max`, `alpha_period_rounds`
-- `use_user_alpha_hetero`
+- `bs_position_xy`, `ris_position_xy`
+- `user_cluster_ratios`
+- `user_cluster_centers_xy`
+- `user_cluster_position_jitter_xy`
+- `user_speed_range`
+- `user_motion_direction_deg`
+- `user_speed_user_mask`
+- `channel_time_step`
+- `channel_carrier_frequency_hz`
+- `alpha_direct`
 - `pilot_SNR_dB`
 
 ### GRU context and prediction target

@@ -18,36 +18,31 @@ class Config:
     num_users = 10  # number of users (K)
     num_bs_antennas = 32  # number of BS antennas (M)
     num_ris_elements = 64  # number of RIS elements (N)
-    num_pilots = 8  # number of pilot transmissions per time slot (P)
+    num_pilots = 16  # number of pilot transmissions per time slot (P)
 
-    # Path-loss settings (synthetic mode)
-    alpha_direct = 3.0  # path-loss exponent for BS-UE
-    alpha_ris = 2.2  # path-loss exponent for RIS-UE (effective)
-    d_direct_min = 100.0
-    d_direct_max = 150.0
-    d_ris_min = 50.0
-    d_ris_max = 100.0
+    # Mobility-driven synthetic geometry
+    bs_position_xy = [0.0, 0.0]
+    ris_position_xy = [30.0, 0.0]
+    user_cluster_ratios = [0.5, 0.5]  # near / far user clusters
+    # user_cluster_ratios = [1]  # near / far user clusters
+    user_cluster_centers_xy = [[40.0, 8.0], [80.0, -12.0]]
+    user_cluster_position_jitter_xy = [[10.0, 10.0], [10.0, 10.0]]
+    # user_cluster_centers_xy = [[50.0, 0.0]]
+    # user_cluster_position_jitter_xy = [[1.0, 1.0]]
+    user_speed_range = [10, 20]  # m/s; sampled per-user, then combined with a random direction
+    user_motion_direction_deg = 1.5  # None=random direction per-user; float=fixed direction for all users
+    # user_speed_user_mask = 1  # 1 means all users move; list of 1-based user ids moves only those users
+    user_speed_user_mask = [9, 10]
+    channel_time_step = 1e-3  # seconds between consecutive channel samples
+    channel_carrier_frequency_hz = 3.5e9
+    channel_min_distance = 1.0
+    alpha_direct = 3.0  # path-loss exponent for BS-UE direct link
     channel_ref_scale = math.sqrt(1e-10)  # match baseline normalization ref=(1e-10)^0.5
 
     # Link switch: [reflection, direct]
     # [1,0] reflection only (default), [0,1] direct only (no RIS), [1,1] both, [0,0] invalid
     link_switch = [1, 0]
 
-    # channel settings (RIS->UE link, RU)
-    channel_alpha = 0.3  # AR(1)
-    use_dynamic_alpha = False
-    dynamic_alpha_mode = "sinusoid"  # "sinusoid" | "piecewise"
-    alpha_min = 0.50
-    alpha_max = 0.98
-    alpha_period_rounds = 5
-    alpha_piecewise = [(5, 0.98), (10, 0.85), (15, 0.60), (20, 0.90), (50, 0.50), (100, 0.60), (150, 0.70), (200, 0.80),
-                       (250, 0.90)]
-
-    # per-user heterogeneity
-    # channel dynamic (alpha_k heterogeneity)
-    use_user_alpha_hetero = False
-    alpha_user_min = 0.60
-    alpha_user_max = 0.98
     # Pilot observation noise
     pilot_SNR_dB = 20
 
@@ -75,7 +70,7 @@ class Config:
     cnn_arch_pool_mode = "last"  # "last" or "mean"
 
     # Federated learning settings
-    num_rounds = 50 # number of communication rounds
+    num_rounds = 100  # number of communication rounds
     local_epochs = 3  # local update epochs per round (per user)
     local_lr = 1e-3  # learning rate for local training
     batch_size = 8  # batch size for local training (None means use all data per epoch)
@@ -84,7 +79,7 @@ class Config:
 
     # AirComp and communication settings
     use_aircomp = True  # whether to simulate AirComp aggregation with noise
-    SNR_dB = 0  # SNR in dB for AirComp (if use_aircomp is True)
+    SNR_dB = 20  # SNR in dB for AirComp (if use_aircomp is True)
     noise_std = math.pow(10, - (SNR_dB / 20.0))  # noise standard deviation from SNR_dB (20 dB -> ~0.1)
     # OTA aggregation settings (Phase1)
     ota_tx_power = 0.1
@@ -94,7 +89,7 @@ class Config:
     ota_use_weighted_users = True  # if False, always use equal weights (all ones)
     # Optional user-data partition profile (equal/grouped) for experiment bookkeeping.
     # Runtime n_k used by OTA aggregation is computed from actual per-user local sample counts.
-    user_data_partition_mode = "grouped"  # "equal" | "grouped"
+    user_data_partition_mode = "equal"  # "equal" | "grouped"
     user_data_size_equal = 10
     user_group_ratios = [0.3, 0.4, 0.3]  # small/medium/large user fractions, auto-normalized
     user_group_data_sizes = [1, 10, 50]  # small/medium/large n_k for persistent segments
@@ -120,6 +115,7 @@ class Config:
     # Logging settings
     log_to_file = True  # whether to save logs to a file
     log_file_path = "demo.log"  # log file path if enabled
+    log_oa_vectors = False  # whether to print optimized beamformer/RIS vectors
 
     # Debug visualization: per-user Reptile head parameter projection
     enable_reptile_head_debug_plot = False

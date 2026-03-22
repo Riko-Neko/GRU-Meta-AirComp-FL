@@ -4,6 +4,8 @@ import math
 import os
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
+from matplotlib.ticker import MultipleLocator
 import numpy as np
 import torch
 
@@ -258,20 +260,25 @@ def _predict_gru_dual_ri(model, x_seq, hidden_state=None):
     )
 
 
-def _predict_h_ru_gru(model, x_seq, n_ris, mode, uplink_tau_ratio, hidden_state=None):
+def _predict_h_ru_gru(model, x_seq, n_ris, mode, uplink_tau_ratio, hidden_state=None, target_stats=None):
     pred_t, pred_delta = _predict_gru_dual_ri(model, x_seq, hidden_state=hidden_state)
     pred_dual = np.concatenate([pred_t, pred_delta], axis=0).astype(np.float32, copy=False)
+    if target_stats is not None:
+        pred_dual = _invert_standardization(pred_dual, target_stats)
     pred = _select_gru_ri_output(pred_dual, n_ris, mode, uplink_tau_ratio)
     return _ri_to_complex(pred, n_ris)
 
 
-def _predict_h_ru_plain(model, x_seq, n_ris):
+def _predict_h_ru_plain(model, x_seq, n_ris, target_stats=None):
     model.eval()
     device = next(model.parameters()).device
     with torch.no_grad():
         x_tensor = torch.tensor(x_seq, dtype=torch.float32, device=device).unsqueeze(0)
         pred = model(x_tensor)
-    return _ri_to_complex(pred.squeeze(0).cpu().numpy(), n_ris)
+    pred_ri = pred.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+    if target_stats is not None:
+        pred_ri = _invert_standardization(pred_ri, target_stats)
+    return _ri_to_complex(pred_ri, n_ris)
 
 
 def _complex_nmse(est, target, eps=1e-12):
@@ -280,6 +287,249 @@ def _complex_nmse(est, target, eps=1e-12):
     err_power = float(np.linalg.norm(est_arr - target_arr) ** 2)
     ref_power = float(np.linalg.norm(target_arr) ** 2)
     return err_power / (ref_power + float(eps))
+
+
+def _compute_standardization_stats(arrays, feature_ndim, eps=1e-6):
+    if not arrays:
+        raise ValueError("arrays must be non-empty to compute standardization stats")
+    packed = []
+    feature_shape = None
+    for arr in arrays:
+        arr_np = np.asarray(arr, dtype=np.float32)
+        if arr_np.ndim < feature_ndim:
+            raise ValueError(f"Array with shape {arr_np.shape} has fewer than {feature_ndim} feature dims")
+        tail_shape = arr_np.shape[-feature_ndim:] if feature_ndim > 0 else ()
+        if feature_shape is None:
+            feature_shape = tail_shape
+        elif tail_shape != feature_shape:
+            raise ValueError(f"Inconsistent feature shape: expected {feature_shape}, got {tail_shape}")
+        packed.append(arr_np.reshape(-1, *tail_shape))
+    stacked = np.concatenate(packed, axis=0)
+    mean = stacked.mean(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    std = stacked.std(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    std = np.maximum(std, float(eps)).astype(np.float32, copy=False)
+    return {"mean": mean, "std": std}
+
+
+def _apply_standardization(arr, stats):
+    arr_np = np.asarray(arr, dtype=np.float32)
+    return ((arr_np - stats["mean"]) / stats["std"]).astype(np.float32, copy=False)
+
+
+def _invert_standardization(arr, stats):
+    arr_np = np.asarray(arr, dtype=np.float32)
+    return ((arr_np * stats["std"]) + stats["mean"]).astype(np.float32, copy=False)
+
+
+def _standardize_sample(sample, input_stats, target_stats):
+    x, y = sample
+    return (
+        _apply_standardization(x, input_stats),
+        _apply_standardization(y, target_stats),
+    )
+
+
+def _flatten_sample_groups(sample_groups):
+    flat = []
+    for item in sample_groups:
+        if item is None:
+            continue
+        if isinstance(item, list):
+            flat.extend(item)
+        else:
+            flat.append(item)
+    return flat
+
+
+def _format_min_mean_max(values):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return "min/mean/max=(n/a/n/a/n/a)"
+    return (
+        f"min/mean/max=({float(arr.min()):.4e}/"
+        f"{float(arr.mean()):.4e}/"
+        f"{float(arr.max()):.4e})"
+    )
+
+
+def _format_xy(coord):
+    xy = np.asarray(coord, dtype=np.float64).reshape(-1)
+    if xy.size != 2:
+        return "[n/a, n/a]"
+    return f"[{float(xy[0]):.3f}, {float(xy[1]):.3f}]"
+
+
+def _save_user_location_velocity_plot(
+        initial_positions_xy,
+        velocity_vectors_xy,
+        bs_position_xy,
+        ris_position_xy,
+        out_path,
+):
+    """
+    Save a 2D map of initial user positions and movement vectors.
+    Arrow lengths remain proportional to speed through a single global scale, while the
+    coordinate system is rendered as a square equal-aspect geometry map.
+    """
+    positions = np.asarray(initial_positions_xy, dtype=np.float64).reshape(-1, 2)
+    velocities = np.asarray(velocity_vectors_xy, dtype=np.float64).reshape(-1, 2)
+    if positions.shape != velocities.shape:
+        raise ValueError(
+            f"positions and velocities must share shape (K,2), got {positions.shape} vs {velocities.shape}"
+        )
+    if positions.shape[0] == 0:
+        raise ValueError("No user positions to plot")
+
+    bs_xy = np.asarray(bs_position_xy, dtype=np.float64).reshape(2)
+    ris_xy = np.asarray(ris_position_xy, dtype=np.float64).reshape(2)
+
+    speed = np.linalg.norm(velocities, axis=1)
+    speed_max = float(np.max(speed))
+
+    base_points = np.vstack([positions, bs_xy[None, :], ris_xy[None, :]])
+    base_x_min = float(np.min(base_points[:, 0]))
+    base_x_max = float(np.max(base_points[:, 0]))
+    base_y_min = float(np.min(base_points[:, 1]))
+    base_y_max = float(np.max(base_points[:, 1]))
+    base_span = max(base_x_max - base_x_min, base_y_max - base_y_min, 100.0)
+    vector_plot_scale = 0.18 * base_span / max(speed_max, 1e-12)
+    velocities_plot = velocities * vector_plot_scale
+    arrow_end = positions + velocities_plot
+    all_points = np.vstack([base_points, arrow_end])
+    raw_x_min = float(np.min(all_points[:, 0]))
+    raw_x_max = float(np.max(all_points[:, 0]))
+    raw_y_min = float(np.min(all_points[:, 1]))
+    raw_y_max = float(np.max(all_points[:, 1]))
+
+    major_grid_step = 10.0
+    minor_grid_step = 5.0
+    x_min_aligned = major_grid_step * math.floor(raw_x_min / major_grid_step)
+    x_max_aligned = major_grid_step * math.ceil(raw_x_max / major_grid_step)
+    y_min_aligned = major_grid_step * math.floor(raw_y_min / major_grid_step)
+    y_max_aligned = major_grid_step * math.ceil(raw_y_max / major_grid_step)
+    x_span = x_max_aligned - x_min_aligned
+    y_span = y_max_aligned - y_min_aligned
+    side_span = major_grid_step * math.ceil(max(x_span, y_span, 100.0) / major_grid_step)
+    x_pad = 0.5 * (side_span - x_span)
+    y_pad = 0.5 * (side_span - y_span)
+    x_min = x_min_aligned - x_pad
+    x_max = x_max_aligned + x_pad
+    y_min = y_min_aligned - y_pad
+    y_max = y_max_aligned + y_pad
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    ax.scatter(
+        positions[:, 0],
+        positions[:, 1],
+        s=16,
+        color="#202020",
+        edgecolors="black",
+        linewidths=0.35,
+        zorder=3,
+        label="User initial positions",
+    )
+
+    nonzero = speed > 1e-12
+    quiver = None
+    if np.any(nonzero):
+        quiver = ax.quiver(
+            positions[nonzero, 0],
+            positions[nonzero, 1],
+            velocities_plot[nonzero, 0],
+            velocities_plot[nonzero, 1],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            width=0.0032,
+            headwidth=4.8,
+            headlength=6.0,
+            headaxislength=5.2,
+            color="#1f5aa6",
+            linewidth=0.6,
+            zorder=2,
+        )
+
+    ax.scatter(
+        [bs_xy[0]],
+        [bs_xy[1]],
+        marker="^",
+        s=46,
+        facecolors="white",
+        edgecolors="#b22222",
+        linewidths=1.2,
+        label="BS",
+        zorder=4,
+    )
+    ax.scatter(
+        [ris_xy[0]],
+        [ris_xy[1]],
+        marker="D",
+        s=34,
+        facecolors="white",
+        edgecolors="#1f7a3f",
+        linewidths=1.2,
+        label="RIS",
+        zorder=4,
+    )
+
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_title("Initial User Geometry and Velocity Vectors")
+    ax.set_axisbelow(True)
+    ax.xaxis.set_major_locator(MultipleLocator(major_grid_step))
+    ax.yaxis.set_major_locator(MultipleLocator(major_grid_step))
+    ax.xaxis.set_minor_locator(MultipleLocator(minor_grid_step))
+    ax.yaxis.set_minor_locator(MultipleLocator(minor_grid_step))
+    ax.grid(which="major", color="#8a8a8a", linestyle="-", linewidth=0.9, alpha=0.9)
+    ax.grid(which="minor", color="#c2c2c2", linestyle="--", linewidth=0.55, alpha=0.85)
+    ax.tick_params(axis="both", which="major", labelsize=9)
+    legend = ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+        fontsize=8,
+        framealpha=0.9,
+        handlelength=1.2,
+        labelspacing=0.3,
+    )
+    fig.tight_layout(rect=(0.0, 0.06, 0.84, 1.0))
+    if quiver is not None:
+        ref_speed = max(5.0, 5.0 * math.ceil(speed_max / 5.0))
+        ref_len_axes = (ref_speed * vector_plot_scale) / max(x_max - x_min, 1e-9)
+        fig.canvas.draw()
+        legend_bbox = legend.get_window_extent(renderer=fig.canvas.get_renderer()).transformed(ax.transAxes.inverted())
+        ref_x0 = float(legend_bbox.x0)
+        ref_y0 = float(legend_bbox.y0) - 0.08
+        ref_arrow = FancyArrowPatch(
+            (ref_x0, ref_y0),
+            (ref_x0 + ref_len_axes, ref_y0),
+            arrowstyle="-|>",
+            mutation_scale=12.0,
+            linewidth=1.6,
+            color="black",
+            transform=ax.transAxes,
+            clip_on=False,
+        )
+        ax.add_patch(ref_arrow)
+        ax.text(
+            ref_x0,
+            ref_y0 - 0.035,
+            f"Speed reference: {ref_speed:.1f} m/s",
+            fontsize=8,
+            color="black",
+            ha="left",
+            va="top",
+            transform=ax.transAxes,
+            clip_on=False,
+        )
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
 
 
 def _format_complex_matrix_for_log(vec_complex):
@@ -303,7 +553,7 @@ def _log_gru_dual_head_debug(logger, round_idx, user_idx, pred_dual_ri, target_d
     target_delta = _ri_to_complex(target_delta_ri, n_ris)
     total_loss = None
     if (loss_t is not None) and (loss_delta is not None):
-        total_loss = float(loss_t) + float(loss_delta)
+        total_loss = 0.5 * (float(loss_t) + float(loss_delta))
 
     loss_t_text = "n/a" if loss_t is None else f"{float(loss_t):.6f}"
     loss_delta_text = "n/a" if loss_delta is None else f"{float(loss_delta):.6f}"
@@ -530,39 +780,15 @@ def main():
     pilot_noise_std = float(np.power(10.0, -pilot_snr_db / 20.0))
     logger.info(f"Pilot SNR_dB: {pilot_snr_db:.2f}")
 
+    ru_evolver = None
     h_BUs = None
     if config.use_synthetic_data:
-        # Strictly align baseline main.py: Rayleigh H_BR and channel scaling by ref
-        ref = float(config.channel_ref_scale)
-        H_BR = ((np.random.randn(config.num_ris_elements, config.num_bs_antennas) +
-                 1j * np.random.randn(config.num_ris_elements, config.num_bs_antennas)) / np.sqrt(2)).astype(
-            np.complex64)
+        ru_evolver = build_ru_channel_evolver_from_config(config)
+        H_BR = ru_evolver.initialize_br_channel()
+        h_RUs, h_BUs = ru_evolver.initialize_user_channels(include_direct=(direct_on == 1))
 
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
         theta_ota = np.ones(config.num_ris_elements, dtype=np.complex64)
-
-        # Path-loss samples (no explicit geometry; distances drawn from ranges)
-        d_dir = np.random.uniform(config.d_direct_min,
-                                  config.d_direct_max,
-                                  size=(config.num_users,))
-        d_ris = np.random.uniform(config.d_ris_min,
-                                  config.d_ris_max,
-                                  size=(config.num_users,))
-        pl_direct = np.power(d_dir, -float(config.alpha_direct))  # per-user
-        pl_ris = np.power(d_ris, -float(config.alpha_ris))        # per-user
-
-        # Initialize user channels (at time 0)
-        h_RUs = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64)
-        for k in range(config.num_users):
-            h_RUs[k] = ((np.random.randn(config.num_ris_elements) + 1j * np.random.randn(
-                config.num_ris_elements)) / np.sqrt(2) * np.sqrt(pl_ris[k]) / ref).astype(np.complex64)
-
-        if direct_on == 1:
-            h_BUs = ((np.random.randn(config.num_users, config.num_bs_antennas) +
-                      1j * np.random.randn(config.num_users, config.num_bs_antennas)) / np.sqrt(2)).astype(
-                np.complex64)
-            # Apply per-user path-loss and baseline ref normalization to direct link
-            h_BUs = (h_BUs.T * (np.sqrt(pl_direct) / ref)).T.astype(np.complex64)
 
     else:
         H_BR, h_RUs_static, h_BUs_static = RISdata.load_data(
@@ -591,6 +817,8 @@ def main():
             )
             config.num_ris_elements = int(h_RUs.shape[1])
 
+        ru_evolver = build_ru_channel_evolver_from_config(config)
+
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
         theta_ota = np.ones(config.num_ris_elements, dtype=np.complex64)
         if direct_on == 1:
@@ -604,6 +832,61 @@ def main():
                 else:
                     h_BUs = h_BUs_static[:, 0, :].astype(np.complex64)
 
+    cluster_counts = np.bincount(ru_evolver.cluster_ids, minlength=len(config.user_cluster_ratios)).tolist()
+    ris_dist_t0 = ru_evolver.ris_distances(ru_evolver.initial_positions)
+    speed_mag = ru_evolver.speed_magnitudes
+    logger.info(
+        "Mobility-driven synthetic channel model: "
+        f"BS={np.round(ru_evolver.bs_position, 3).tolist()}, "
+        f"RIS={np.round(ru_evolver.ris_position, 3).tolist()}, "
+        f"dt={float(config.channel_time_step):.4e}s, "
+        f"fc={float(config.channel_carrier_frequency_hz):.4e}Hz"
+    )
+    logger.info(
+        f"User mobility clusters counts={cluster_counts}, "
+        f"|v|(min/mean/max)=({float(speed_mag.min()):.3f}/{float(speed_mag.mean()):.3f}/{float(speed_mag.max()):.3f}) m/s"
+    )
+    direction_mode = (
+        "random"
+        if ru_evolver.fixed_direction_deg is None
+        else f"fixed {float(ru_evolver.fixed_direction_deg):.2f} deg"
+    )
+    moving_users_text = "all" if len(ru_evolver.moving_user_ids) == int(config.num_users) else str(ru_evolver.moving_user_ids)
+    logger.info(f"Mobility direction mode={direction_mode}, moving_users={moving_users_text}")
+    for user_idx, velocity_xy in enumerate(ru_evolver.velocity_vectors, start=1):
+        logger.info(
+            f"User {user_idx} fixed velocity -> "
+            f"v=[{float(velocity_xy[0]):.4f}, {float(velocity_xy[1]):.4f}] m/s, "
+            f"|v|={float(np.linalg.norm(velocity_xy)):.4f} m/s"
+        )
+    logger.info(
+        f"RIS distance at t0 (min/mean/max)=({float(ris_dist_t0.min()):.3f}/{float(ris_dist_t0.mean()):.3f}/{float(ris_dist_t0.max()):.3f})"
+    )
+    if direct_on == 1:
+        direct_dist_t0 = ru_evolver.direct_distances(ru_evolver.initial_positions)
+        logger.info(
+            f"BS-user distance at t0 (min/mean/max)=("
+            f"{float(direct_dist_t0.min()):.3f}/{float(direct_dist_t0.mean()):.3f}/{float(direct_dist_t0.max()):.3f})"
+        )
+
+    # Plot initial user coordinates and motion vectors (debug/visualization only).
+    try:
+        location_out_dir = os.path.join("figs", "location")
+        location_out_path = os.path.join(
+            location_out_dir,
+            f"{config.log_prefix()}_{config.fingerprint()}_user_motion.png",
+        )
+        saved_location_path = _save_user_location_velocity_plot(
+            initial_positions_xy=ru_evolver.initial_positions,
+            velocity_vectors_xy=ru_evolver.velocity_vectors,
+            bs_position_xy=ru_evolver.bs_position,
+            ris_position_xy=ru_evolver.ris_position,
+            out_path=location_out_path,
+        )
+        logger.info(f"Saved user location/motion map: {saved_location_path}")
+    except Exception as exc:
+        logger.info(f"Failed to save user location/motion map: {exc}")
+
     # Set initial BS beamforming vector f (e.g., all ones)
     f_beam = np.ones(config.num_bs_antennas, dtype=np.complex64)
 
@@ -616,6 +899,7 @@ def main():
     output_dim = 2 * config.num_ris_elements
     gru_csi_target_mode = _parse_gru_target_mode(config.gru_csi_target_mode)
     uplink_tau_ratio = float(getattr(config, "uplink_tau_ratio", 0.5))
+    log_oa_vectors = bool(getattr(config, "log_oa_vectors", False))
     if not (0.0 <= uplink_tau_ratio <= 1.0):
         raise ValueError("Config.uplink_tau_ratio must be in [0, 1]")
     use_uplink_linear = (gru_csi_target_mode == "uplink_linear")
@@ -790,7 +1074,6 @@ def main():
         aggregator = MetaUpdater(meta_algorithm="FedAvg", step_size=1.0, use_aircomp=False, aircomp_simulator=None)
     # Trainer for local updates
     trainer = GRUTrainer(learning_rate=config.local_lr, epochs=config.local_epochs, batch_size=config.batch_size)
-    ru_evolver = build_ru_channel_evolver_from_config(config)
     # Simulation rounds
     logger.info(f"Starting training for {config.num_rounds} rounds...")
 
@@ -803,38 +1086,53 @@ def main():
                 logger.info(f"Reset persistent hidden states at round {round_idx} (reason={reason}).")
                 reset_hidden_next_round = False
         h_RUs_uplink = None
+        h_BUs_uplink = None
         alpha_used_uplink = None
         if use_persistent_hidden_state:
             # Persistent mode uses variable-length continuous segments per user.
             h_RUs_next = np.zeros_like(h_RUs)
+            h_BUs_next = np.zeros_like(h_BUs) if h_BUs is not None else None
             alpha_used_next = np.zeros((config.num_users,), dtype=np.float32)
             if use_uplink_linear:
                 h_RUs_uplink = np.zeros_like(h_RUs)
+                h_BUs_uplink = np.zeros_like(h_BUs) if h_BUs is not None else None
                 alpha_used_uplink = np.zeros((config.num_users,), dtype=np.float32)
         else:
             # One-step channel evolution for non-persistent mode.
             if use_uplink_linear:
-                h_RUs_uplink, h_RUs_next, alpha_used_next, alpha_used_uplink = ru_evolver.step_split(
+                step_result = ru_evolver.step_split(
                     h_RUs,
                     round_idx,
                     uplink_tau_ratio,
+                    h_BUs=h_BUs,
                 )
-                alpha_used_next = alpha_used_next.astype(np.float32, copy=False)
-                alpha_used_uplink = alpha_used_uplink.astype(np.float32, copy=False)
+                h_RUs_uplink = step_result.h_ru_tau
+                h_RUs_next = step_result.h_ru_next
+                h_BUs_uplink = step_result.h_bu_tau
+                h_BUs_next = step_result.h_bu_next
+                alpha_used_next = step_result.alpha_delta.astype(np.float32, copy=False)
+                alpha_used_uplink = step_result.alpha_tau.astype(np.float32, copy=False)
             else:
-                h_RUs_next, alpha_used_next = ru_evolver.step(h_RUs, round_idx)
+                step_result = ru_evolver.step(h_RUs, round_idx, h_BUs=h_BUs)
+                h_RUs_next = step_result.h_ru_next
+                h_BUs_next = step_result.h_bu_next
+                alpha_used_next = step_result.alpha_delta.astype(np.float32, copy=False)
 
         # Generate pilot observation and ground truth channel for each user at this round
         local_data = []
         local_data_stateful = [[] for _ in range(config.num_users)] if use_persistent_hidden_state else None
         local_data_arch = [None for _ in range(config.num_users)] if enable_cnn_arch_ablation else None
         local_data_baseline = [None for _ in range(config.num_users)] if enable_cnn_baseline else None
+        user_pos_t_for_log = np.zeros((config.num_users, 2), dtype=np.float64)
+        user_pos_uplink_for_log = np.zeros((config.num_users, 2), dtype=np.float64)
+        h_ru_signal_norms = []
+        y_pilot_gru_norms = []
+        target_delta_norms = []
         for k in range(config.num_users):
-            # Pilot signals for user k
-            h_BU_k = h_BUs[k] if h_BUs is not None else None
             if use_persistent_hidden_state:
                 seg_count = max(1, int(round(float(user_n_k_target[k]))))
                 h_ru_seg = h_RUs[k].copy()
+                h_bu_seg = h_BUs[k].copy() if h_BUs is not None else None
                 seq_samples = []
                 arch_seq_samples = [] if enable_cnn_arch_ablation else None
                 baseline_seq_samples = [] if enable_cnn_baseline else None
@@ -842,6 +1140,9 @@ def main():
                 alpha_tau_last = 0.0
                 for seg_idx in range(seg_count):
                     time_idx = int(user_segment_time[k] + 1)
+                    pos_t_seg = ru_evolver.positions_at(float(time_idx - 1))[k]
+                    pos_uplink_seg = ru_evolver.positions_at(float(time_idx - 1) + uplink_tau_ratio)[k]
+                    h_BU_k = h_bu_seg if h_bu_seg is not None else None
                     Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
                         H_BR,
                         h_ru_seg,
@@ -855,24 +1156,33 @@ def main():
                     obs_imag = np.imag(Y_pilot)
                     obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
                     X_seq = obs_step[None, :, :]  # (1, 2, P), one continuous segment
+                    h_ru_signal_norms.append(float(np.linalg.norm(h_ru_seg)))
+                    y_pilot_gru_norms.append(float(np.linalg.norm(Y_pilot)))
 
                     if use_uplink_linear:
-                        h_tau_seg, h_next_seg, alpha_seg, alpha_tau_seg = ru_evolver.step_single_split(
+                        step_seg = ru_evolver.step_single_split(
                             h_ru_seg,
                             user_idx=k,
                             round_idx=time_idx,
                             tau_ratio=uplink_tau_ratio,
+                            h_bu=h_bu_seg,
                         )
                     else:
-                        h_tau_seg = None
-                        _, h_next_seg, alpha_seg, _ = ru_evolver.step_single_split(
+                        step_seg = ru_evolver.step_single_split(
                             h_ru_seg,
                             user_idx=k,
                             round_idx=time_idx,
                             tau_ratio=1.0,
+                            h_bu=h_bu_seg,
                         )
-                        alpha_tau_seg = 0.0
+                    h_tau_seg = step_seg.h_ru_tau if use_uplink_linear else None
+                    h_next_seg = step_seg.h_ru_next
+                    h_bu_tau_seg = step_seg.h_bu_tau if use_uplink_linear else None
+                    h_bu_next_seg = step_seg.h_bu_next
+                    alpha_seg = step_seg.alpha_delta
+                    alpha_tau_seg = step_seg.alpha_tau if use_uplink_linear else 0.0
                     y = _build_gru_dual_target(h_ru_seg, h_next_seg)
+                    target_delta_norms.append(float(np.linalg.norm(h_next_seg - h_ru_seg)))
                     seq_samples.append((X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False)))
 
                     if enable_cnn_arch_ablation:
@@ -920,8 +1230,11 @@ def main():
                         )
 
                     h_ru_seg = h_next_seg
+                    h_bu_seg = h_bu_next_seg
                     alpha_last = alpha_seg
                     alpha_tau_last = alpha_tau_seg
+                    user_pos_t_for_log[k] = pos_t_seg
+                    user_pos_uplink_for_log[k] = pos_uplink_seg
                     user_segment_time[k] = time_idx
 
                 local_data_stateful[k] = seq_samples
@@ -932,16 +1245,25 @@ def main():
                     local_data_baseline[k] = baseline_seq_samples
                 if use_uplink_linear:
                     h_RUs_uplink[k] = h_tau_seg
+                    if h_BUs_uplink is not None and h_bu_tau_seg is not None:
+                        h_BUs_uplink[k] = h_bu_tau_seg
                     alpha_used_uplink[k] = float(alpha_tau_last)
                 h_RUs_next[k] = h_ru_seg
+                if h_BUs_next is not None and h_bu_seg is not None:
+                    h_BUs_next[k] = h_bu_seg
                 alpha_used_next[k] = float(alpha_last)
             else:
+                h_BU_k = h_BUs[k] if h_BUs is not None else None
+                user_pos_t_for_log[k] = ru_evolver.positions_at(float(round_idx - 1))[k]
+                user_pos_uplink_for_log[k] = ru_evolver.positions_at(float(round_idx - 1) + uplink_tau_ratio)[k]
                 Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam, theta_pilot,
                     noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
+                h_ru_signal_norms.append(float(np.linalg.norm(h_RUs[k])))
+                y_pilot_gru_norms.append(float(np.linalg.norm(Y_pilot)))
 
                 # Build GRU sequence input: X_seq shape (W, 2, P) --> (seq_len, 2, obs_dim)
                 obs_real = np.real(Y_pilot)  # Separate real and imag channels
@@ -963,6 +1285,7 @@ def main():
                     X_seq = obs_step[None, :, :]  # (1, 2, P)
 
                 y = _build_gru_dual_target(h_RUs[k], h_RUs_next[k])
+                target_delta_norms.append(float(np.linalg.norm(h_RUs_next[k] - h_RUs[k])))
                 sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
                 local_data.append(sample)
 
@@ -1021,15 +1344,73 @@ def main():
                 )
                 local_data_baseline[k] = sample_baseline
 
+        gru_flat_samples = _flatten_sample_groups(local_data_stateful if use_persistent_hidden_state else local_data)
+        gru_input_stats = _compute_standardization_stats([sample[0] for sample in gru_flat_samples], feature_ndim=2)
+        gru_target_stats = _compute_standardization_stats([sample[1] for sample in gru_flat_samples], feature_ndim=1)
+        if use_persistent_hidden_state:
+            local_data_stateful = [
+                [_standardize_sample(sample, gru_input_stats, gru_target_stats) for sample in seq]
+                for seq in local_data_stateful
+            ]
+            local_data = [seq[-1] for seq in local_data_stateful]
+        else:
+            local_data = [_standardize_sample(sample, gru_input_stats, gru_target_stats) for sample in local_data]
+
+        arch_input_stats = None
+        baseline_input_stats = None
+        plain_target_stats = None
+        plain_target_arrays = []
+        if enable_cnn_arch_ablation:
+            arch_flat_samples = _flatten_sample_groups(local_data_arch)
+            arch_input_stats = _compute_standardization_stats(
+                [sample[0] for sample in arch_flat_samples],
+                feature_ndim=2,
+            )
+            plain_target_arrays.extend([sample[1] for sample in arch_flat_samples])
+        if enable_cnn_baseline:
+            baseline_flat_samples = _flatten_sample_groups(local_data_baseline)
+            baseline_input_stats = _compute_standardization_stats(
+                [sample[0] for sample in baseline_flat_samples],
+                feature_ndim=2,
+            )
+            plain_target_arrays.extend([sample[1] for sample in baseline_flat_samples])
+        if plain_target_arrays:
+            plain_target_stats = _compute_standardization_stats(plain_target_arrays, feature_ndim=1)
+        if enable_cnn_arch_ablation:
+            if use_persistent_hidden_state:
+                local_data_arch = [
+                    [_standardize_sample(sample, arch_input_stats, plain_target_stats) for sample in seq]
+                    for seq in local_data_arch
+                ]
+            else:
+                local_data_arch = [
+                    _standardize_sample(sample, arch_input_stats, plain_target_stats)
+                    for sample in local_data_arch
+                ]
+        if enable_cnn_baseline:
+            if use_persistent_hidden_state:
+                local_data_baseline = [
+                    [_standardize_sample(sample, baseline_input_stats, plain_target_stats) for sample in seq]
+                    for seq in local_data_baseline
+                ]
+            else:
+                local_data_baseline = [
+                    _standardize_sample(sample, baseline_input_stats, plain_target_stats)
+                    for sample in local_data_baseline
+                ]
+
         # Local training on each user's data
         local_models = []
         losses = []
         gru_losses_t = []
         gru_losses_delta = []
+        gru_local_update_norms = []
         local_models_arch = [] if enable_cnn_arch_ablation else None
         losses_arch = [] if enable_cnn_arch_ablation else None
+        arch_local_update_norms = [] if enable_cnn_arch_ablation else None
         local_models_baseline = [] if enable_cnn_baseline else None
         losses_baseline = [] if enable_cnn_baseline else None
+        baseline_local_update_norms = [] if enable_cnn_baseline else None
         h_RUs_est = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64)
         h_RUs_est_arch = np.zeros((config.num_users, config.num_ris_elements), dtype=np.complex64) \
             if enable_cnn_arch_ablation else None
@@ -1088,9 +1469,12 @@ def main():
                     gru_state_delta_vectors[k] = (vec_next - vec_prev).numpy()
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
-                target_dual_for_log = np.asarray(sample_k[1], dtype=np.float32)
+                target_dual_for_log = _invert_standardization(np.asarray(sample_k[1], dtype=np.float32), gru_target_stats)
                 if pred_last is not None:
-                    pred_dual_for_log = pred_last.numpy().astype(np.float32, copy=False)
+                    pred_dual_for_log = _invert_standardization(
+                        pred_last.numpy().astype(np.float32, copy=False),
+                        gru_target_stats,
+                    )
                     pred_selected = _select_gru_ri_output(
                         pred_dual_for_log,
                         config.num_ris_elements,
@@ -1104,7 +1488,10 @@ def main():
                         sample_k[0],
                         hidden_state=hidden_prev,
                     )
-                    pred_dual_for_log = np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False)
+                    pred_dual_for_log = _invert_standardization(
+                        np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False),
+                        gru_target_stats,
+                    )
                     pred_selected = _select_gru_ri_output(
                         pred_dual_for_log,
                         config.num_ris_elements,
@@ -1119,13 +1506,19 @@ def main():
                 gru_stats = dict(getattr(trainer, "last_loss_stats", {}))
                 gru_loss_t = gru_stats.get("loss_t")
                 gru_loss_delta = gru_stats.get("loss_delta")
-                target_dual_for_log = np.asarray(local_data[k][1], dtype=np.float32)
+                target_dual_for_log = _invert_standardization(
+                    np.asarray(local_data[k][1], dtype=np.float32),
+                    gru_target_stats,
+                )
                 pred_t_ri, pred_delta_ri = _predict_gru_dual_ri(
                     local_model,
                     local_data[k][0],
                     hidden_state=None,
                 )
-                pred_dual_for_log = np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False)
+                pred_dual_for_log = _invert_standardization(
+                    np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False),
+                    gru_target_stats,
+                )
                 pred_selected = _select_gru_ri_output(
                     pred_dual_for_log,
                     config.num_ris_elements,
@@ -1139,6 +1532,9 @@ def main():
                 gru_losses_t.append(float(gru_loss_t))
             if gru_loss_delta is not None:
                 gru_losses_delta.append(float(gru_loss_delta))
+            gru_local_update_norms.append(
+                float(torch.norm(model_delta_to_vector_backbone(local_model, global_model, prefix="backbone")).item())
+            )
             local_models.append(local_model)
             # cache back the personalized head for user k
             user_head_states[k] = {
@@ -1179,11 +1575,19 @@ def main():
                     data_k_arch = [local_data_arch[k]]
                 local_model_arch, loss_arch = trainer.train(local_model_arch, data_k_arch)
                 losses_arch.append(loss_arch if loss_arch is not None else 0.0)
+                arch_local_update_norms.append(
+                    float(
+                        torch.norm(
+                            model_delta_to_vector_backbone(local_model_arch, global_model_arch, prefix="backbone")
+                        ).item()
+                    )
+                )
                 local_models_arch.append(local_model_arch)
                 h_RUs_est_arch[k] = _predict_h_ru_plain(
                     local_model_arch,
                     data_k_arch[-1][0],
                     config.num_ris_elements,
+                    target_stats=plain_target_stats,
                 )
                 user_head_states_arch[k] = {
                     name: param.detach().clone()
@@ -1206,11 +1610,15 @@ def main():
                     data_k_baseline = [local_data_baseline[k]]
                 local_model_baseline, loss_baseline = trainer.train(local_model_baseline, data_k_baseline)
                 losses_baseline.append(loss_baseline if loss_baseline is not None else 0.0)
+                baseline_local_update_norms.append(
+                    float(torch.norm(model_delta_to_vector(local_model_baseline, global_model_baseline)).item())
+                )
                 local_models_baseline.append(local_model_baseline)
                 h_RUs_est_baseline[k] = _predict_h_ru_plain(
                     local_model_baseline,
                     data_k_baseline[-1][0],
                     config.num_ris_elements,
+                    target_stats=plain_target_stats,
                 )
 
             loss_parts = []
@@ -1218,18 +1626,22 @@ def main():
                 if (gru_loss_t is not None) and (gru_loss_delta is not None):
                     loss_parts.append(
                         "GRU(total/t/delta): "
-                        f"\033[34m{loss:.4f}/{gru_loss_t:.4f}/{gru_loss_delta:.4f}\033[0m"
+                        f"\033[34m{loss:.4e}/{gru_loss_t:.4e}/{gru_loss_delta:.4e}\033[0m"
                     )
                 else:
-                    loss_parts.append(f"GRU: \033[34m{loss:.4f}\033[0m")
+                    loss_parts.append(f"GRU: \033[34m{loss:.4e}\033[0m")
             if enable_cnn_arch_ablation and (loss_arch is not None):
-                loss_parts.append(f"CNN-arch: \033[35m{loss_arch:.4f}\033[0m")
+                loss_parts.append(f"CNN-arch: \033[35m{loss_arch:.4e}\033[0m")
             if enable_cnn_baseline and (loss_baseline is not None):
-                loss_parts.append(f"CNN-base: \033[36m{loss_baseline:.4f}\033[0m")
+                loss_parts.append(f"CNN-base: \033[36m{loss_baseline:.4e}\033[0m")
+            pos_text = (
+                f"pos_t={_format_xy(user_pos_t_for_log[k])}, "
+                f"pos_uplink={_format_xy(user_pos_uplink_for_log[k])}"
+            )
             if loss_parts:
-                logger.info(f"User {k + 1} local loss -> " + ", ".join(loss_parts))
+                logger.info(f"User {k + 1} local loss -> " + ", ".join(loss_parts) + f", {pos_text}")
             else:
-                logger.info(f"User {k + 1} local training done.")
+                logger.info(f"User {k + 1} local training done. {pos_text}")
             if (
                 debug_gru_dual_target_log_enabled
                 and (pred_dual_for_log is not None)
@@ -1246,8 +1658,22 @@ def main():
                     gru_loss_delta,
                 )
 
+        logger.info(
+            f"Round {round_idx} GRU signal diagnostics -> "
+            f"||h_RU|| {_format_min_mean_max(h_ru_signal_norms)}, "
+            f"||Y_pilot|| {_format_min_mean_max(y_pilot_gru_norms)}, "
+            f"||target_delta|| {_format_min_mean_max(target_delta_norms)}"
+        )
+        update_parts = [f"GRU-backbone {_format_min_mean_max(gru_local_update_norms)}"]
+        if enable_cnn_arch_ablation and arch_local_update_norms:
+            update_parts.append(f"CNN-arch-backbone {_format_min_mean_max(arch_local_update_norms)}")
+        if enable_cnn_baseline and baseline_local_update_norms:
+            update_parts.append(f"CNN-base {_format_min_mean_max(baseline_local_update_norms)}")
+        logger.info(f"Round {round_idx} local update diagnostics -> " + ", ".join(update_parts))
+
         if losses:
-            round_loss_parts = [f"Round {round_idx} mean local loss -> GRU: {np.mean(losses):.4f}"]
+            gru_round_loss = np.mean(gru_losses_t) if gru_losses_t else np.mean(losses)
+            round_loss_parts = [f"Round {round_idx} mean local loss -> GRU: {gru_round_loss:.4f}"]
             if enable_cnn_arch_ablation and losses_arch:
                 round_loss_parts.append(f"CNN-arch: {np.mean(losses_arch):.4f}")
             if enable_cnn_baseline and losses_baseline:
@@ -1401,11 +1827,12 @@ def main():
         h_eff_baseline = None
         if config.use_aircomp and aircomp_sim is not None:
             h_RUs_ota = h_RUs_uplink if use_uplink_linear else h_RUs
+            h_BUs_ota = h_BUs_uplink if use_uplink_linear else h_BUs
             # Effective channels per user (complex) using each branch's own OTA variables.
             casc_pref = f_beam.conj() @ H_BR.T
             h_eff_list = []
             for k in range(config.num_users):
-                direct = f_beam.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
+                direct = f_beam.conj().dot(h_BUs_ota[k]) if (direct_on == 1 and h_BUs_ota is not None) else 0.0
                 reflect = 0.0
                 if reflect_on == 1:
                     reflect = np.dot(theta_ota, casc_pref * h_RUs_ota[k])
@@ -1417,7 +1844,7 @@ def main():
                 h_eff_list_arch = []
                 for k in range(config.num_users):
                     direct_arch = (
-                        f_beam_arch.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
+                        f_beam_arch.conj().dot(h_BUs_ota[k]) if (direct_on == 1 and h_BUs_ota is not None) else 0.0
                     )
                     reflect_arch = 0.0
                     if reflect_on == 1:
@@ -1430,7 +1857,7 @@ def main():
                 h_eff_list_baseline = []
                 for k in range(config.num_users):
                     direct_baseline = (
-                        f_beam_baseline.conj().dot(h_BUs[k]) if (direct_on == 1 and h_BUs is not None) else 0.0
+                        f_beam_baseline.conj().dot(h_BUs_ota[k]) if (direct_on == 1 and h_BUs_ota is not None) else 0.0
                     )
                     reflect_baseline = 0.0
                     if reflect_on == 1:
@@ -1540,11 +1967,12 @@ def main():
         # Optimize beamforming vector f and RIS phases theta for next round
         logger.info("Optimizing beamforming and RIS configuration.")
         # Use model-estimated h_RU for OTA beam/RIS optimization.
+        h_BUs_opt = h_BUs_uplink if use_uplink_linear else h_BUs
         if oa_optimizer_mode == "state_aware":
             f_beam, theta_ota, nmse_proxy = optimize_beam_ris_state_aware(
                 H_BR,
                 h_RUs_est,
-                h_BUs=h_BUs,
+                h_BUs=h_BUs_opt,
                 theta_init=theta_ota,
                 f_init=f_beam,
                 link_switch=link_switch,
@@ -1564,7 +1992,7 @@ def main():
             f_beam, theta_ota, nmse_proxy = optimize_beam_ris(
                 H_BR,
                 h_RUs_est,
-                h_BUs=h_BUs,
+                h_BUs=h_BUs_opt,
                 theta_init=theta_ota,
                 f_init=f_beam,
                 link_switch=link_switch,
@@ -1577,18 +2005,26 @@ def main():
             )
         # New pilot pattern independent from OTA theta
         theta_pilot = pilot_gen.generate_pilot_pattern(config.num_pilots, config.num_ris_elements)
-        logger.info(f"Optimized f: {np.round(f_beam, 4)}")
-        logger.info(
-            _colorize_branch_line(
-                "GRU",
-                f"Optimized theta_ota: {np.round(theta_ota, 4)}, "
-                f"proxy_NMSE={_highlight_metric_value(nmse_proxy, 'GRU')}",
+        if log_oa_vectors:
+            logger.info(f"Optimized f: {np.round(f_beam, 4)}")
+            logger.info(
+                _colorize_branch_line(
+                    "GRU",
+                    f"Optimized theta_ota: {np.round(theta_ota, 4)}, "
+                    f"proxy_NMSE={_highlight_metric_value(nmse_proxy, 'GRU')}",
+                )
             )
-        )
+        else:
+            logger.info(
+                _colorize_branch_line(
+                    "GRU",
+                    f"GRU proxy_NMSE={_highlight_metric_value(nmse_proxy, 'GRU')}",
+                )
+            )
 
         if enable_cnn_arch_ablation:
             f_beam_arch, theta_ota_arch, nmse_proxy_arch = optimize_beam_ris(
-                H_BR, h_RUs_est_arch, h_BUs=h_BUs, theta_init=theta_ota_arch, f_init=f_beam_arch,
+                H_BR, h_RUs_est_arch, h_BUs=h_BUs_opt, theta_init=theta_ota_arch, f_init=f_beam_arch,
                 link_switch=link_switch, user_weights=K_norm.numpy(),
                 update_vars=delta_var_arch.numpy(),
                 tx_power=config.ota_tx_power,
@@ -1596,19 +2032,27 @@ def main():
                 var_floor=config.ota_var_floor,
                 eps=config.ota_eps,
             )
-            logger.info(f"Optimized f (CNN-arch): {np.round(f_beam_arch, 4)}")
-            logger.info(
-                _colorize_branch_line(
-                    "CNN-arch",
-                    f"Optimized theta_ota (CNN-arch): {np.round(theta_ota_arch, 4)}, "
-                    f"proxy_NMSE={_highlight_metric_value(nmse_proxy_arch, 'CNN-arch')}",
+            if log_oa_vectors:
+                logger.info(f"Optimized f (CNN-arch): {np.round(f_beam_arch, 4)}")
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-arch",
+                        f"Optimized theta_ota (CNN-arch): {np.round(theta_ota_arch, 4)}, "
+                        f"proxy_NMSE={_highlight_metric_value(nmse_proxy_arch, 'CNN-arch')}",
+                    )
                 )
-            )
+            else:
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-arch",
+                        f"CNN-arch proxy_NMSE={_highlight_metric_value(nmse_proxy_arch, 'CNN-arch')}",
+                    )
+                )
 
         if enable_cnn_baseline:
             baseline_user_weights = K_norm.numpy()
             f_beam_baseline, theta_ota_baseline, nmse_proxy_baseline = optimize_beam_ris(
-                H_BR, h_RUs_est_baseline, h_BUs=h_BUs, theta_init=theta_ota_baseline, f_init=f_beam_baseline,
+                H_BR, h_RUs_est_baseline, h_BUs=h_BUs_opt, theta_init=theta_ota_baseline, f_init=f_beam_baseline,
                 link_switch=link_switch, user_weights=baseline_user_weights,
                 update_vars=delta_var_baseline.numpy(),
                 tx_power=config.ota_tx_power,
@@ -1616,14 +2060,22 @@ def main():
                 var_floor=config.ota_var_floor,
                 eps=config.ota_eps,
             )
-            logger.info(f"Optimized f (CNN-base): {np.round(f_beam_baseline, 4)}")
-            logger.info(
-                _colorize_branch_line(
-                    "CNN-base",
-                    f"Optimized theta_ota (CNN-base): {np.round(theta_ota_baseline, 4)}, "
-                    f"proxy_NMSE={_highlight_metric_value(nmse_proxy_baseline, 'CNN-base')}",
+            if log_oa_vectors:
+                logger.info(f"Optimized f (CNN-base): {np.round(f_beam_baseline, 4)}")
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-base",
+                        f"Optimized theta_ota (CNN-base): {np.round(theta_ota_baseline, 4)}, "
+                        f"proxy_NMSE={_highlight_metric_value(nmse_proxy_baseline, 'CNN-base')}",
+                    )
                 )
-            )
+            else:
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-base",
+                        f"CNN-base proxy_NMSE={_highlight_metric_value(nmse_proxy_baseline, 'CNN-base')}",
+                    )
+                )
 
         # Oracle upper-bound AO reference with true channels.
         if gru_csi_target_mode == "t+1":
@@ -1633,7 +2085,7 @@ def main():
         else:
             h_RUs_true_for_oracle = h_RUs
         f_beam_oracle, theta_ota_oracle, nmse_proxy_oracle = optimize_beam_ris(
-            H_BR, h_RUs_true_for_oracle, h_BUs=h_BUs, theta_init=theta_ota_oracle, f_init=f_beam_oracle,
+            H_BR, h_RUs_true_for_oracle, h_BUs=h_BUs_opt, theta_init=theta_ota_oracle, f_init=f_beam_oracle,
             link_switch=link_switch, user_weights=K_norm.numpy(),
             update_vars=delta_var.numpy(),
             tx_power=config.ota_tx_power,
@@ -1641,30 +2093,51 @@ def main():
             var_floor=config.ota_var_floor,
             eps=config.ota_eps,
         )
-        logger.info(f"Optimized f (Oracle-true): {np.round(f_beam_oracle, 4)}")
-        logger.info(
-            _colorize_branch_line(
-                "Oracle-true",
-                f"Optimized theta_ota (Oracle-true): {np.round(theta_ota_oracle, 4)}, "
-                f"proxy_NMSE={_highlight_metric_value(nmse_proxy_oracle, 'Oracle-true')}",
+        if log_oa_vectors:
+            logger.info(f"Optimized f (Oracle-true): {np.round(f_beam_oracle, 4)}")
+            logger.info(
+                _colorize_branch_line(
+                    "Oracle-true",
+                    f"Optimized theta_ota (Oracle-true): {np.round(theta_ota_oracle, 4)}, "
+                    f"proxy_NMSE={_highlight_metric_value(nmse_proxy_oracle, 'Oracle-true')}",
+                )
             )
-        )
+        else:
+            logger.info(
+                _colorize_branch_line(
+                    "Oracle-true",
+                    f"Oracle-true proxy_NMSE={_highlight_metric_value(nmse_proxy_oracle, 'Oracle-true')}",
+                )
+            )
 
         # Advance channels to the precomputed next-round state.
         h_RUs = h_RUs_next
+        h_BUs = h_BUs_next
         alpha_used = alpha_used_next
-        if config.use_dynamic_alpha:
-            logger.info(f"RU dynamic alpha(t) (mode={config.dynamic_alpha_mode}): {alpha_used}, "
-                        f"min={alpha_used.min():.4f}, max={alpha_used.max():.4f}"
-                        )
-        else:
-            logger.info(f"RU per-user alpha_k: {alpha_used}, "
-                        f"min={alpha_used.min():.4f}, max={alpha_used.max():.4f}"
-                        )
+        logger.info(
+            f"RU mobility alpha_k(v): {alpha_used}, "
+            f"min={alpha_used.min():.4f}, max={alpha_used.max():.4f}"
+        )
         if use_uplink_linear and (alpha_used_uplink is not None):
             logger.info(
                 f"RU uplink alpha_tau_k: {alpha_used_uplink}, "
                 f"min={alpha_used_uplink.min():.4f}, max={alpha_used_uplink.max():.4f}"
+            )
+        if use_persistent_hidden_state:
+            user_time_steps = user_segment_time.astype(np.float64, copy=False)
+        else:
+            user_time_steps = np.full((config.num_users,), float(round_idx), dtype=np.float64)
+        current_positions = ru_evolver.positions_at_steps(user_time_steps)
+        current_ris_dist = ru_evolver.ris_distances(current_positions)
+        logger.info(
+            f"RIS distance after round {round_idx} (min/mean/max)=("
+            f"{float(current_ris_dist.min()):.3f}/{float(current_ris_dist.mean()):.3f}/{float(current_ris_dist.max()):.3f})"
+        )
+        if direct_on == 1:
+            current_direct_dist = ru_evolver.direct_distances(current_positions)
+            logger.info(
+                f"BS-user distance after round {round_idx} (min/mean/max)=("
+                f"{float(current_direct_dist.min()):.3f}/{float(current_direct_dist.mean()):.3f}/{float(current_direct_dist.max()):.3f})"
             )
 
     logger.info("Training process completed.")
