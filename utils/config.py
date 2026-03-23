@@ -18,21 +18,21 @@ class Config:
     num_users = 10  # number of users (K)
     num_bs_antennas = 32  # number of BS antennas (M)
     num_ris_elements = 64  # number of RIS elements (N)
-    num_pilots = 16  # number of pilot transmissions per time slot (P)
+    num_pilots = 4  # number of pilot transmissions per time slot (P)
 
     # Mobility-driven synthetic geometry
     bs_position_xy = [0.0, 0.0]
     ris_position_xy = [30.0, 0.0]
-    user_cluster_ratios = [0.5, 0.5]  # near / far user clusters
-    # user_cluster_ratios = [1]  # near / far user clusters
-    user_cluster_centers_xy = [[40.0, 8.0], [80.0, -12.0]]
-    user_cluster_position_jitter_xy = [[10.0, 10.0], [10.0, 10.0]]
-    # user_cluster_centers_xy = [[50.0, 0.0]]
-    # user_cluster_position_jitter_xy = [[1.0, 1.0]]
+    # user_cluster_ratios = [0.5, 0.5]  # near / far user clusters
+    user_cluster_ratios = [1]  # near / far user clusters
+    # user_cluster_centers_xy = [[40.0, 8.0], [80.0, -12.0]]
+    # user_cluster_position_jitter_xy = [[10.0, 10.0], [10.0, 10.0]]
+    user_cluster_centers_xy = [[50.0, 0.0]]
+    user_cluster_position_jitter_xy = [[10.0, 10.0]]
     user_speed_range = [10, 20]  # m/s; sampled per-user, then combined with a random direction
     user_motion_direction_deg = 1.5  # None=random direction per-user; float=fixed direction for all users
-    # user_speed_user_mask = 1  # 1 means all users move; list of 1-based user ids moves only those users
-    user_speed_user_mask = [9, 10]
+    user_speed_user_mask = []  # 1 means all users move; list of 1-based user ids moves only those users
+    # user_speed_user_mask = [9, 10]
     channel_time_step = 1e-3  # seconds between consecutive channel samples
     channel_carrier_frequency_hz = 3.5e9
     channel_min_distance = 1.0

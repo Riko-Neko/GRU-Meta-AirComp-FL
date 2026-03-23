@@ -329,6 +329,20 @@ def _standardize_sample(sample, input_stats, target_stats):
     )
 
 
+def _build_window_sample(obs_buffer, current_step, W, obs_dim, pad_val):
+    seq = list(obs_buffer)
+    if seq:
+        seq[-1] = current_step
+    else:
+        seq = [current_step]
+    X_seq = np.stack(seq, axis=0)
+    if X_seq.shape[0] < W:
+        pad_len = W - X_seq.shape[0]
+        pad = np.full((pad_len, 2, obs_dim), pad_val, dtype=np.float32)
+        X_seq = np.concatenate([pad, X_seq], axis=0)
+    return X_seq.astype(np.float32, copy=False)
+
+
 def _flatten_sample_groups(sample_groups):
     flat = []
     for item in sample_groups:
@@ -954,7 +968,6 @@ def main():
     logger.info("CNN-arch/CNN-base CSI target mode=t")
     global_model = CSICNNGRU(observation_dim=obs_dim, output_dim=output_dim)
     user_hidden_states = [None for _ in range(config.num_users)]
-    user_segment_time = np.zeros((config.num_users,), dtype=np.int64)
     reset_hidden_next_round = False
     # For warm-start heads: keep a global head template to clone for users
     global_head_state = {k: v.clone() for k, v in global_model.state_dict().items() if k.startswith("head")}
@@ -1088,287 +1101,175 @@ def main():
         h_RUs_uplink = None
         h_BUs_uplink = None
         alpha_used_uplink = None
-        if use_persistent_hidden_state:
-            # Persistent mode uses variable-length continuous segments per user.
-            h_RUs_next = np.zeros_like(h_RUs)
-            h_BUs_next = np.zeros_like(h_BUs) if h_BUs is not None else None
-            alpha_used_next = np.zeros((config.num_users,), dtype=np.float32)
-            if use_uplink_linear:
-                h_RUs_uplink = np.zeros_like(h_RUs)
-                h_BUs_uplink = np.zeros_like(h_BUs) if h_BUs is not None else None
-                alpha_used_uplink = np.zeros((config.num_users,), dtype=np.float32)
+        if use_uplink_linear:
+            step_result = ru_evolver.step_split(
+                h_RUs,
+                round_idx,
+                uplink_tau_ratio,
+                h_BUs=h_BUs,
+            )
+            h_RUs_uplink = step_result.h_ru_tau
+            h_RUs_next = step_result.h_ru_next
+            h_BUs_uplink = step_result.h_bu_tau
+            h_BUs_next = step_result.h_bu_next
+            alpha_used_next = step_result.alpha_delta.astype(np.float32, copy=False)
+            alpha_used_uplink = step_result.alpha_tau.astype(np.float32, copy=False)
         else:
-            # One-step channel evolution for non-persistent mode.
-            if use_uplink_linear:
-                step_result = ru_evolver.step_split(
-                    h_RUs,
-                    round_idx,
-                    uplink_tau_ratio,
-                    h_BUs=h_BUs,
-                )
-                h_RUs_uplink = step_result.h_ru_tau
-                h_RUs_next = step_result.h_ru_next
-                h_BUs_uplink = step_result.h_bu_tau
-                h_BUs_next = step_result.h_bu_next
-                alpha_used_next = step_result.alpha_delta.astype(np.float32, copy=False)
-                alpha_used_uplink = step_result.alpha_tau.astype(np.float32, copy=False)
-            else:
-                step_result = ru_evolver.step(h_RUs, round_idx, h_BUs=h_BUs)
-                h_RUs_next = step_result.h_ru_next
-                h_BUs_next = step_result.h_bu_next
-                alpha_used_next = step_result.alpha_delta.astype(np.float32, copy=False)
+            step_result = ru_evolver.step(h_RUs, round_idx, h_BUs=h_BUs)
+            h_RUs_next = step_result.h_ru_next
+            h_BUs_next = step_result.h_bu_next
+            alpha_used_next = step_result.alpha_delta.astype(np.float32, copy=False)
 
-        # Generate pilot observation and ground truth channel for each user at this round
-        local_data = []
-        local_data_stateful = [[] for _ in range(config.num_users)] if use_persistent_hidden_state else None
+        # Generate pilot observation and ground truth channel for each user at this round.
+        # Physical time advances once per round; n_k only controls how many same-round
+        # training observations are generated from the current channel block.
+        local_data = [None for _ in range(config.num_users)]
+        local_data_groups = [[] for _ in range(config.num_users)]
         local_data_arch = [None for _ in range(config.num_users)] if enable_cnn_arch_ablation else None
+        local_data_arch_groups = [[] for _ in range(config.num_users)] if enable_cnn_arch_ablation else None
         local_data_baseline = [None for _ in range(config.num_users)] if enable_cnn_baseline else None
+        local_data_baseline_groups = [[] for _ in range(config.num_users)] if enable_cnn_baseline else None
         user_pos_t_for_log = np.zeros((config.num_users, 2), dtype=np.float64)
         user_pos_uplink_for_log = np.zeros((config.num_users, 2), dtype=np.float64)
         h_ru_signal_norms = []
         y_pilot_gru_norms = []
         target_delta_norms = []
+        positions_t_round = ru_evolver.positions_at(float(round_idx - 1))
+        positions_uplink_round = ru_evolver.positions_at(float(round_idx - 1) + uplink_tau_ratio)
         for k in range(config.num_users):
-            if use_persistent_hidden_state:
-                seg_count = max(1, int(round(float(user_n_k_target[k]))))
-                h_ru_seg = h_RUs[k].copy()
-                h_bu_seg = h_BUs[k].copy() if h_BUs is not None else None
-                seq_samples = []
-                arch_seq_samples = [] if enable_cnn_arch_ablation else None
-                baseline_seq_samples = [] if enable_cnn_baseline else None
-                alpha_last = 0.0
-                alpha_tau_last = 0.0
-                for seg_idx in range(seg_count):
-                    time_idx = int(user_segment_time[k] + 1)
-                    pos_t_seg = ru_evolver.positions_at(float(time_idx - 1))[k]
-                    pos_uplink_seg = ru_evolver.positions_at(float(time_idx - 1) + uplink_tau_ratio)[k]
-                    h_BU_k = h_bu_seg if h_bu_seg is not None else None
-                    Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
-                        H_BR,
-                        h_ru_seg,
-                        f_beam,
-                        theta_pilot,
-                        noise_std=pilot_noise_std,
-                        h_BU=h_BU_k,
-                        link_switch=link_switch,
-                    )
-                    obs_real = np.real(Y_pilot)
-                    obs_imag = np.imag(Y_pilot)
-                    obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
-                    X_seq = obs_step[None, :, :]  # (1, 2, P), one continuous segment
-                    h_ru_signal_norms.append(float(np.linalg.norm(h_ru_seg)))
-                    y_pilot_gru_norms.append(float(np.linalg.norm(Y_pilot)))
+            sample_count_k = max(1, int(round(float(user_n_k_target[k]))))
+            h_BU_k = h_BUs[k] if h_BUs is not None else None
+            user_pos_t_for_log[k] = positions_t_round[k]
+            user_pos_uplink_for_log[k] = positions_uplink_round[k]
+            y_gru = _build_gru_dual_target(h_RUs[k], h_RUs_next[k])
+            y_plain = _complex_to_ri(h_RUs[k])
+            delta_norm_k = float(np.linalg.norm(h_RUs_next[k] - h_RUs[k]))
 
-                    if use_uplink_linear:
-                        step_seg = ru_evolver.step_single_split(
-                            h_ru_seg,
-                            user_idx=k,
-                            round_idx=time_idx,
-                            tau_ratio=uplink_tau_ratio,
-                            h_bu=h_bu_seg,
-                        )
-                    else:
-                        step_seg = ru_evolver.step_single_split(
-                            h_ru_seg,
-                            user_idx=k,
-                            round_idx=time_idx,
-                            tau_ratio=1.0,
-                            h_bu=h_bu_seg,
-                        )
-                    h_tau_seg = step_seg.h_ru_tau if use_uplink_linear else None
-                    h_next_seg = step_seg.h_ru_next
-                    h_bu_tau_seg = step_seg.h_bu_tau if use_uplink_linear else None
-                    h_bu_next_seg = step_seg.h_bu_next
-                    alpha_seg = step_seg.alpha_delta
-                    alpha_tau_seg = step_seg.alpha_tau if use_uplink_linear else 0.0
-                    y = _build_gru_dual_target(h_ru_seg, h_next_seg)
-                    target_delta_norms.append(float(np.linalg.norm(h_next_seg - h_ru_seg)))
-                    seq_samples.append((X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False)))
-
-                    if enable_cnn_arch_ablation:
-                        Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
-                            H_BR,
-                            h_ru_seg,
-                            f_beam_arch,
-                            theta_pilot,
-                            noise_std=pilot_noise_std,
-                            h_BU=h_BU_k,
-                            link_switch=link_switch,
-                        )
-                        obs_real_arch = np.real(Y_pilot_arch)
-                        obs_imag_arch = np.imag(Y_pilot_arch)
-                        obs_step_arch = np.stack([obs_real_arch, obs_imag_arch], axis=0).astype(np.float32)
-                        X_seq_arch = obs_step_arch[None, :, :]
-                        y_arch = _complex_to_ri(h_ru_seg)
-                        arch_seq_samples.append(
-                            (
-                                X_seq_arch.astype(np.float32, copy=False),
-                                y_arch.astype(np.float32, copy=False),
-                            )
-                        )
-
-                    if enable_cnn_baseline:
-                        Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
-                            H_BR,
-                            h_ru_seg,
-                            f_beam_baseline,
-                            theta_pilot,
-                            noise_std=pilot_noise_std,
-                            h_BU=h_BU_k,
-                            link_switch=link_switch,
-                        )
-                        obs_real_baseline = np.real(Y_pilot_baseline)
-                        obs_imag_baseline = np.imag(Y_pilot_baseline)
-                        obs_step_baseline = np.stack([obs_real_baseline, obs_imag_baseline], axis=0).astype(np.float32)
-                        X_seq_baseline = obs_step_baseline[None, :, :]
-                        y_baseline = _complex_to_ri(h_ru_seg)
-                        baseline_seq_samples.append(
-                            (
-                                X_seq_baseline.astype(np.float32, copy=False),
-                                y_baseline.astype(np.float32, copy=False),
-                            )
-                        )
-
-                    h_ru_seg = h_next_seg
-                    h_bu_seg = h_bu_next_seg
-                    alpha_last = alpha_seg
-                    alpha_tau_last = alpha_tau_seg
-                    user_pos_t_for_log[k] = pos_t_seg
-                    user_pos_uplink_for_log[k] = pos_uplink_seg
-                    user_segment_time[k] = time_idx
-
-                local_data_stateful[k] = seq_samples
-                local_data.append(seq_samples[-1])
-                if enable_cnn_arch_ablation:
-                    local_data_arch[k] = arch_seq_samples
-                if enable_cnn_baseline:
-                    local_data_baseline[k] = baseline_seq_samples
-                if use_uplink_linear:
-                    h_RUs_uplink[k] = h_tau_seg
-                    if h_BUs_uplink is not None and h_bu_tau_seg is not None:
-                        h_BUs_uplink[k] = h_bu_tau_seg
-                    alpha_used_uplink[k] = float(alpha_tau_last)
-                h_RUs_next[k] = h_ru_seg
-                if h_BUs_next is not None and h_bu_seg is not None:
-                    h_BUs_next[k] = h_bu_seg
-                alpha_used_next[k] = float(alpha_last)
+            # Canonical current-round observation used for inference/state update.
+            Y_pilot_canon, _, _ = pilot_gen.simulate_pilot_observation(
+                H_BR, h_RUs[k], f_beam, theta_pilot,
+                noise_std=pilot_noise_std,
+                h_BU=h_BU_k,
+                link_switch=link_switch,
+            )
+            obs_step_canon = np.stack([np.real(Y_pilot_canon), np.imag(Y_pilot_canon)], axis=0).astype(np.float32)
+            if use_time_window and W > 1:
+                obs_buffers[k].append(obs_step_canon)
+                X_seq_canon = _build_window_sample(obs_buffers[k], obs_step_canon, W, obs_dim, pad_val)
             else:
-                h_BU_k = h_BUs[k] if h_BUs is not None else None
-                user_pos_t_for_log[k] = ru_evolver.positions_at(float(round_idx - 1))[k]
-                user_pos_uplink_for_log[k] = ru_evolver.positions_at(float(round_idx - 1) + uplink_tau_ratio)[k]
+                X_seq_canon = obs_step_canon[None, :, :]
+            local_data[k] = (X_seq_canon.astype(np.float32, copy=False), y_gru.astype(np.float32, copy=False))
+
+            for _ in range(sample_count_k):
                 Y_pilot, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam, theta_pilot,
                     noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
+                obs_step = np.stack([np.real(Y_pilot), np.imag(Y_pilot)], axis=0).astype(np.float32)
+                if use_time_window and W > 1:
+                    X_seq = _build_window_sample(obs_buffers[k], obs_step, W, obs_dim, pad_val)
+                else:
+                    X_seq = obs_step[None, :, :]
+                local_data_groups[k].append((X_seq.astype(np.float32, copy=False), y_gru.astype(np.float32, copy=False)))
                 h_ru_signal_norms.append(float(np.linalg.norm(h_RUs[k])))
                 y_pilot_gru_norms.append(float(np.linalg.norm(Y_pilot)))
+                target_delta_norms.append(delta_norm_k)
 
-                # Build GRU sequence input: X_seq shape (W, 2, P) --> (seq_len, 2, obs_dim)
-                obs_real = np.real(Y_pilot)  # Separate real and imag channels
-                obs_imag = np.imag(Y_pilot)
-                obs_step = np.stack([obs_real, obs_imag], axis=0).astype(np.float32)  # (2, P)
+            if use_time_window and W > 1 and round_idx <= 3 and k == 0:
+                logger.info(f"Example X_seq shape for user1: {local_data_groups[k][0][0].shape}")  # (W,2,P)
 
-                if use_time_window and W > 1:
-                    obs_buffers[k].append(obs_step)  # append current step
-                    seq = list(obs_buffers[k])  # list of (2,P), length <= W
-                    X_seq = np.stack(seq, axis=0)  # (len, 2, P)
-
-                    # Pad to fixed W (left-padding)
-                    if X_seq.shape[0] < W:
-                        pad_len = W - X_seq.shape[0]
-                        pad = np.full((pad_len, 2, obs_dim), pad_val, dtype=np.float32)
-                        X_seq = np.concatenate([pad, X_seq], axis=0)  # (W, 2, P)
-                else:
-                    # Fallback: seq_len = 1
-                    X_seq = obs_step[None, :, :]  # (1, 2, P)
-
-                y = _build_gru_dual_target(h_RUs[k], h_RUs_next[k])
-                target_delta_norms.append(float(np.linalg.norm(h_RUs_next[k] - h_RUs[k])))
-                sample = (X_seq.astype(np.float32, copy=False), y.astype(np.float32, copy=False))
-                local_data.append(sample)
-
-            if (not use_persistent_hidden_state) and use_time_window and W > 1 and round_idx <= 3 and k == 0:
-                logger.info(f"Example X_seq shape for user1: {sample[0].shape}")  # (W,2,P)
-
-            if enable_cnn_arch_ablation and (not use_persistent_hidden_state):
-                Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
+            if enable_cnn_arch_ablation:
+                Y_pilot_arch_canon, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_arch, theta_pilot,
                     noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
-
-                obs_real_arch = np.real(Y_pilot_arch)
-                obs_imag_arch = np.imag(Y_pilot_arch)
-                obs_step_arch = np.stack([obs_real_arch, obs_imag_arch], axis=0).astype(np.float32)
-
-                # No state is used in architecture ablation.
-                # Input mode follows GRU context setting: single-step or window.
+                obs_step_arch_canon = np.stack(
+                    [np.real(Y_pilot_arch_canon), np.imag(Y_pilot_arch_canon)],
+                    axis=0,
+                ).astype(np.float32)
                 if use_time_window and W > 1:
-                    obs_buffers_arch[k].append(obs_step_arch)
-                    seq_arch = list(obs_buffers_arch[k])
-                    X_seq_arch = np.stack(seq_arch, axis=0)
-                    if X_seq_arch.shape[0] < W:
-                        pad_len_arch = W - X_seq_arch.shape[0]
-                        pad_arch = np.full((pad_len_arch, 2, obs_dim), pad_val, dtype=np.float32)
-                        X_seq_arch = np.concatenate([pad_arch, X_seq_arch], axis=0)
+                    obs_buffers_arch[k].append(obs_step_arch_canon)
+                    X_seq_arch_canon = _build_window_sample(
+                        obs_buffers_arch[k], obs_step_arch_canon, W, obs_dim, pad_val
+                    )
                 else:
-                    X_seq_arch = obs_step_arch[None, :, :]  # (1, 2, P)
-
-                y_arch = _complex_to_ri(h_RUs[k])
-                sample_arch = (
-                    X_seq_arch.astype(np.float32, copy=False),
-                    y_arch.astype(np.float32, copy=False),
+                    X_seq_arch_canon = obs_step_arch_canon[None, :, :]
+                local_data_arch[k] = (
+                    X_seq_arch_canon.astype(np.float32, copy=False),
+                    y_plain.astype(np.float32, copy=False),
                 )
-                local_data_arch[k] = sample_arch
-            if enable_cnn_baseline and (not use_persistent_hidden_state):
-                Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
+                for _ in range(sample_count_k):
+                    Y_pilot_arch, _, _ = pilot_gen.simulate_pilot_observation(
+                        H_BR, h_RUs[k], f_beam_arch, theta_pilot,
+                        noise_std=pilot_noise_std,
+                        h_BU=h_BU_k,
+                        link_switch=link_switch,
+                    )
+                    obs_step_arch = np.stack([np.real(Y_pilot_arch), np.imag(Y_pilot_arch)], axis=0).astype(np.float32)
+                    if use_time_window and W > 1:
+                        X_seq_arch = _build_window_sample(obs_buffers_arch[k], obs_step_arch, W, obs_dim, pad_val)
+                    else:
+                        X_seq_arch = obs_step_arch[None, :, :]
+                    local_data_arch_groups[k].append(
+                        (X_seq_arch.astype(np.float32, copy=False), y_plain.astype(np.float32, copy=False))
+                    )
+
+            if enable_cnn_baseline:
+                Y_pilot_baseline_canon, _, _ = pilot_gen.simulate_pilot_observation(
                     H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
                     noise_std=pilot_noise_std,
                     h_BU=h_BU_k,
                     link_switch=link_switch,
                 )
-
-                # Literature baseline uses memoryless single-step pilot input.
-                obs_real_baseline = np.real(Y_pilot_baseline)
-                obs_imag_baseline = np.imag(Y_pilot_baseline)
-                obs_step_baseline = np.stack([obs_real_baseline, obs_imag_baseline], axis=0).astype(np.float32)
-                X_seq_baseline = obs_step_baseline[None, :, :]  # (1, 2, P)
-
-                y_baseline = _complex_to_ri(h_RUs[k])
-                sample_baseline = (
-                    X_seq_baseline.astype(np.float32, copy=False),
-                    y_baseline.astype(np.float32, copy=False),
+                obs_step_baseline_canon = np.stack(
+                    [np.real(Y_pilot_baseline_canon), np.imag(Y_pilot_baseline_canon)],
+                    axis=0,
+                ).astype(np.float32)
+                local_data_baseline[k] = (
+                    obs_step_baseline_canon[None, :, :].astype(np.float32, copy=False),
+                    y_plain.astype(np.float32, copy=False),
                 )
-                local_data_baseline[k] = sample_baseline
+                for _ in range(sample_count_k):
+                    Y_pilot_baseline, _, _ = pilot_gen.simulate_pilot_observation(
+                        H_BR, h_RUs[k], f_beam_baseline, theta_pilot,
+                        noise_std=pilot_noise_std,
+                        h_BU=h_BU_k,
+                        link_switch=link_switch,
+                    )
+                    obs_step_baseline = np.stack(
+                        [np.real(Y_pilot_baseline), np.imag(Y_pilot_baseline)],
+                        axis=0,
+                    ).astype(np.float32)
+                    local_data_baseline_groups[k].append(
+                        (obs_step_baseline[None, :, :].astype(np.float32, copy=False), y_plain.astype(np.float32, copy=False))
+                    )
 
-        gru_flat_samples = _flatten_sample_groups(local_data_stateful if use_persistent_hidden_state else local_data)
+        gru_flat_samples = _flatten_sample_groups(local_data_groups)
         gru_input_stats = _compute_standardization_stats([sample[0] for sample in gru_flat_samples], feature_ndim=2)
         gru_target_stats = _compute_standardization_stats([sample[1] for sample in gru_flat_samples], feature_ndim=1)
-        if use_persistent_hidden_state:
-            local_data_stateful = [
-                [_standardize_sample(sample, gru_input_stats, gru_target_stats) for sample in seq]
-                for seq in local_data_stateful
-            ]
-            local_data = [seq[-1] for seq in local_data_stateful]
-        else:
-            local_data = [_standardize_sample(sample, gru_input_stats, gru_target_stats) for sample in local_data]
+        local_data_groups = [
+            [_standardize_sample(sample, gru_input_stats, gru_target_stats) for sample in seq]
+            for seq in local_data_groups
+        ]
+        local_data = [_standardize_sample(sample, gru_input_stats, gru_target_stats) for sample in local_data]
 
         arch_input_stats = None
         baseline_input_stats = None
         plain_target_stats = None
         plain_target_arrays = []
         if enable_cnn_arch_ablation:
-            arch_flat_samples = _flatten_sample_groups(local_data_arch)
+            arch_flat_samples = _flatten_sample_groups(local_data_arch_groups)
             arch_input_stats = _compute_standardization_stats(
                 [sample[0] for sample in arch_flat_samples],
                 feature_ndim=2,
             )
             plain_target_arrays.extend([sample[1] for sample in arch_flat_samples])
         if enable_cnn_baseline:
-            baseline_flat_samples = _flatten_sample_groups(local_data_baseline)
+            baseline_flat_samples = _flatten_sample_groups(local_data_baseline_groups)
             baseline_input_stats = _compute_standardization_stats(
                 [sample[0] for sample in baseline_flat_samples],
                 feature_ndim=2,
@@ -1377,27 +1278,23 @@ def main():
         if plain_target_arrays:
             plain_target_stats = _compute_standardization_stats(plain_target_arrays, feature_ndim=1)
         if enable_cnn_arch_ablation:
-            if use_persistent_hidden_state:
-                local_data_arch = [
-                    [_standardize_sample(sample, arch_input_stats, plain_target_stats) for sample in seq]
-                    for seq in local_data_arch
-                ]
-            else:
-                local_data_arch = [
-                    _standardize_sample(sample, arch_input_stats, plain_target_stats)
-                    for sample in local_data_arch
-                ]
+            local_data_arch_groups = [
+                [_standardize_sample(sample, arch_input_stats, plain_target_stats) for sample in seq]
+                for seq in local_data_arch_groups
+            ]
+            local_data_arch = [
+                _standardize_sample(sample, arch_input_stats, plain_target_stats)
+                for sample in local_data_arch
+            ]
         if enable_cnn_baseline:
-            if use_persistent_hidden_state:
-                local_data_baseline = [
-                    [_standardize_sample(sample, baseline_input_stats, plain_target_stats) for sample in seq]
-                    for seq in local_data_baseline
-                ]
-            else:
-                local_data_baseline = [
-                    _standardize_sample(sample, baseline_input_stats, plain_target_stats)
-                    for sample in local_data_baseline
-                ]
+            local_data_baseline_groups = [
+                [_standardize_sample(sample, baseline_input_stats, plain_target_stats) for sample in seq]
+                for seq in local_data_baseline_groups
+            ]
+            local_data_baseline = [
+                _standardize_sample(sample, baseline_input_stats, plain_target_stats)
+                for sample in local_data_baseline
+            ]
 
         # Local training on each user's data
         local_models = []
@@ -1441,18 +1338,23 @@ def main():
 
             # Train on user k's data
             if use_persistent_hidden_state:
-                seq_k = local_data_stateful[k]
-                sample_k = seq_k[-1]
+                data_k = local_data_groups[k]
+                sample_k = local_data[k]
                 hidden_prev = user_hidden_states[k]
-                local_model, loss, hidden_next, pred_last = trainer.train_stateful_sequence(
+                local_model, loss = trainer.train_stateful_independent(
                     local_model,
-                    seq_k,
+                    data_k,
                     hidden_state=hidden_prev,
                 )
                 gru_stats = dict(getattr(trainer, "last_loss_stats", {}))
                 gru_loss_t = gru_stats.get("loss_t")
                 gru_loss_delta = gru_stats.get("loss_delta")
-                samples_used_k = max(1, len(seq_k))
+                samples_used_k = max(1, len(data_k))
+                pred_last, hidden_next = trainer.infer_stateful_sample(
+                    local_model,
+                    sample_k,
+                    hidden_state=hidden_prev,
+                )
                 user_hidden_states[k] = hidden_next
                 state_fast_x_round[k] = compute_hidden_drift_ratio(
                     hidden_prev=hidden_prev,
@@ -1470,37 +1372,19 @@ def main():
                 if (round_idx <= 3) and (k == 0) and (hidden_next is not None):
                     logger.info(f"User1 persistent hidden norm: {torch.norm(hidden_next).item():.4e}")
                 target_dual_for_log = _invert_standardization(np.asarray(sample_k[1], dtype=np.float32), gru_target_stats)
-                if pred_last is not None:
-                    pred_dual_for_log = _invert_standardization(
-                        pred_last.numpy().astype(np.float32, copy=False),
-                        gru_target_stats,
-                    )
-                    pred_selected = _select_gru_ri_output(
-                        pred_dual_for_log,
-                        config.num_ris_elements,
-                        gru_csi_target_mode,
-                        uplink_tau_ratio,
-                    )
-                    h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
-                else:
-                    pred_t_ri, pred_delta_ri = _predict_gru_dual_ri(
-                        local_model,
-                        sample_k[0],
-                        hidden_state=hidden_prev,
-                    )
-                    pred_dual_for_log = _invert_standardization(
-                        np.concatenate([pred_t_ri, pred_delta_ri], axis=0).astype(np.float32, copy=False),
-                        gru_target_stats,
-                    )
-                    pred_selected = _select_gru_ri_output(
-                        pred_dual_for_log,
-                        config.num_ris_elements,
-                        gru_csi_target_mode,
-                        uplink_tau_ratio,
-                    )
-                    h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
+                pred_dual_for_log = _invert_standardization(
+                    pred_last.numpy().astype(np.float32, copy=False),
+                    gru_target_stats,
+                )
+                pred_selected = _select_gru_ri_output(
+                    pred_dual_for_log,
+                    config.num_ris_elements,
+                    gru_csi_target_mode,
+                    uplink_tau_ratio,
+                )
+                h_RUs_est[k] = _ri_to_complex(pred_selected, config.num_ris_elements)
             else:
-                data_k = [local_data[k]]
+                data_k = local_data_groups[k]
                 samples_used_k = max(1, len(data_k))
                 local_model, loss = trainer.train(local_model, data_k)
                 gru_stats = dict(getattr(trainer, "last_loss_stats", {}))
@@ -1569,10 +1453,7 @@ def main():
                 for hk, hv in user_head_states_arch[k].items():
                     state_arch[hk] = hv.clone()
                 local_model_arch.load_state_dict(state_arch)
-                if use_persistent_hidden_state:
-                    data_k_arch = local_data_arch[k]
-                else:
-                    data_k_arch = [local_data_arch[k]]
+                data_k_arch = local_data_arch_groups[k]
                 local_model_arch, loss_arch = trainer.train(local_model_arch, data_k_arch)
                 losses_arch.append(loss_arch if loss_arch is not None else 0.0)
                 arch_local_update_norms.append(
@@ -1585,7 +1466,7 @@ def main():
                 local_models_arch.append(local_model_arch)
                 h_RUs_est_arch[k] = _predict_h_ru_plain(
                     local_model_arch,
-                    data_k_arch[-1][0],
+                    local_data_arch[k][0],
                     config.num_ris_elements,
                     target_stats=plain_target_stats,
                 )
@@ -1604,10 +1485,7 @@ def main():
                     hidden_size=int(config.cnn_baseline_hidden_size),
                 )
                 local_model_baseline.load_state_dict(global_model_baseline.state_dict())
-                if use_persistent_hidden_state:
-                    data_k_baseline = local_data_baseline[k]
-                else:
-                    data_k_baseline = [local_data_baseline[k]]
+                data_k_baseline = local_data_baseline_groups[k]
                 local_model_baseline, loss_baseline = trainer.train(local_model_baseline, data_k_baseline)
                 losses_baseline.append(loss_baseline if loss_baseline is not None else 0.0)
                 baseline_local_update_norms.append(
@@ -1616,7 +1494,7 @@ def main():
                 local_models_baseline.append(local_model_baseline)
                 h_RUs_est_baseline[k] = _predict_h_ru_plain(
                     local_model_baseline,
-                    data_k_baseline[-1][0],
+                    local_data_baseline[k][0],
                     config.num_ris_elements,
                     target_stats=plain_target_stats,
                 )
@@ -2123,10 +2001,7 @@ def main():
                 f"RU uplink alpha_tau_k: {alpha_used_uplink}, "
                 f"min={alpha_used_uplink.min():.4f}, max={alpha_used_uplink.max():.4f}"
             )
-        if use_persistent_hidden_state:
-            user_time_steps = user_segment_time.astype(np.float64, copy=False)
-        else:
-            user_time_steps = np.full((config.num_users,), float(round_idx), dtype=np.float64)
+        user_time_steps = np.full((config.num_users,), float(round_idx), dtype=np.float64)
         current_positions = ru_evolver.positions_at_steps(user_time_steps)
         current_ris_dist = ru_evolver.ris_distances(current_positions)
         logger.info(
