@@ -29,91 +29,67 @@ def _compute_effective_channels(H_BR, h_RUs, f_vec, theta_vec, h_BUs, reflect_on
     return g_vec.astype(np.complex64), h_eff, hk_list
 
 
-def _build_hk_list(H_BR, h_RUs, theta_vec, h_BUs, reflect_on, direct_on):
-    """Build per-user equivalent uplink channels hk(theta) at BS."""
-    hk_list = []
-    for user_idx in range(h_RUs.shape[0]):
-        hk = np.zeros(H_BR.shape[1], dtype=np.complex64)
-        if reflect_on:
-            hk = hk + H_BR.conj().T.dot(theta_vec * h_RUs[user_idx])
-        if direct_on and h_BUs is not None:
-            hk = hk + h_BUs[user_idx]
-        hk_list.append(hk.astype(np.complex64))
-    return hk_list
+def _compute_eta_proxy(h_eff, user_weights, update_vars, tx_power, noise_std, eps):
+    inner2 = np.abs(h_eff) ** 2 + eps
+    eta_candidates = tx_power * inner2 / (np.square(user_weights) * update_vars + eps)
+    eta = float(np.min(eta_candidates).real)
+    noise_power = float((noise_std ** 2) * tx_power)
+    nmse_proxy = noise_power / (eta * (np.square(user_weights.sum()) + eps))
+    return eta_candidates, eta, nmse_proxy
 
 
-def _update_f_closed_form(hk_list, b_vec, omega_vec, noise_var, eps=1e-8, normalize_f=True, f_fallback=None):
+def _build_affine_channel_maps(H_BR, h_RUs, h_BUs, reflect_on, direct_on):
     """
-    Closed-form update:
-      f* = (sum_k omega_k |b_k|^2 h_k h_k^H + noise_var I)^(-1) sum_k omega_k b_k* h_k
+    Map the current effective channel model to the affine form used by the SCA example:
+        h_k(theta) = h_d,k + G_k theta
+    where G_k = H_BR^H diag(h_RU,k).
     """
-    if not hk_list:
-        raise ValueError("hk_list is empty")
-    m = hk_list[0].size
-    scatter = noise_var * np.eye(m, dtype=np.complex128)
-    rhs = np.zeros((m,), dtype=np.complex128)
-    for user_idx, hk in enumerate(hk_list):
-        omega_k = float(omega_vec[user_idx])
-        b_k = b_vec[user_idx]
-        scatter += omega_k * (np.abs(b_k) ** 2) * np.outer(hk, hk.conj())
-        rhs += omega_k * np.conj(b_k) * hk
-    try:
-        f_vec = np.linalg.solve(scatter, rhs)
-    except np.linalg.LinAlgError:
-        f_vec = np.linalg.pinv(scatter, rcond=float(eps)).dot(rhs)
-    f_vec = f_vec.astype(np.complex64)
-    if normalize_f:
-        f_vec = _normalize_vector(f_vec, fallback=f_fallback)
-    return f_vec
-
-
-def _update_theta_phase_gradient(H_BR, h_RUs, h_BUs, f_vec, theta_vec, b_vec, omega_vec,
-                                 reflect_on, direct_on, theta_lr, theta_grad_steps):
-    """
-    Projected gradient update on RIS phases:
-      theta_n = exp(j * phi_n), optimize over real-valued phi.
-    """
-    if not reflect_on or int(theta_grad_steps) <= 0:
-        return theta_vec.astype(np.complex64)
-
     k_users, n_ris = h_RUs.shape
-    g_vec = H_BR.dot(f_vec).astype(np.complex64)  # (N,)
-    # Reflect term: f^H H^H (theta * h_ru,k) = sum_n theta_n * (conj(g_n) * h_ru,k,n)
-    v_kn = (np.conj(g_vec)[None, :] * h_RUs).astype(np.complex64)  # (K, N)
+    m_bs = H_BR.shape[1]
+    h_direct = np.zeros((m_bs, k_users), dtype=np.complex128)
+    g_maps = np.zeros((m_bs, n_ris, k_users), dtype=np.complex128)
+    H_herm = H_BR.conj().T.astype(np.complex128, copy=False)
 
-    direct_terms = np.zeros((k_users,), dtype=np.complex64)
-    if direct_on and h_BUs is not None:
-        for user_idx in range(k_users):
-            direct_terms[user_idx] = f_vec.conj().dot(h_BUs[user_idx])
-
-    phi = np.angle(theta_vec).astype(np.float64)
-    theta = np.exp(1j * phi).astype(np.complex64)
-    b_arr = np.asarray(b_vec, dtype=np.complex64).reshape(-1)
-    omega_arr = np.asarray(omega_vec, dtype=np.float64).reshape(-1)
-    lr = float(theta_lr)
-
-    for _ in range(int(theta_grad_steps)):
-        reflect_terms = np.sum(theta[None, :] * v_kn, axis=1)  # (K,)
-        a_k = b_arr * (direct_terms + reflect_terms)
-        err_k = a_k - 1.0
-        # dE/dphi_n = 2 * Re( sum_k omega_k * conj(err_k) * j*b_k*theta_n*v_kn )
-        term_kn = (np.conj(err_k) * b_arr)[:, None] * (theta[None, :] * v_kn)
-        grad_phi = 2.0 * np.real(1j * (omega_arr[:, None] * term_kn).sum(axis=0))
-        phi = phi - lr * grad_phi
-        theta = np.exp(1j * phi).astype(np.complex64)
-
-    return theta.astype(np.complex64)
+    for user_idx in range(k_users):
+        if direct_on and h_BUs is not None:
+            h_direct[:, user_idx] = np.asarray(h_BUs[user_idx], dtype=np.complex128)
+        if reflect_on:
+            g_maps[:, :, user_idx] = H_herm * np.asarray(h_RUs[user_idx], dtype=np.complex128)[None, :]
+    return h_direct, g_maps
 
 
-def _compute_state_aware_objective(hk_list, f_vec, b_vec, omega_vec, noise_var):
-    residual = np.zeros((len(hk_list),), dtype=np.complex64)
-    for user_idx, hk in enumerate(hk_list):
-        residual[user_idx] = b_vec[user_idx] * f_vec.conj().dot(hk) - 1.0
-    return float(np.sum(omega_vec * (np.abs(residual) ** 2)) + noise_var * (np.linalg.norm(f_vec) ** 2))
+def _solve_sca_mu(a_mat, b_mat, c_vec, k2_eff, mu_init, eps):
+    from scipy.optimize import minimize
+
+    def objective(mu_vec):
+        linear_term = float(np.dot(c_vec, mu_vec))
+        return float(2.0 * np.linalg.norm(a_mat @ mu_vec) + 2.0 * np.linalg.norm(b_mat @ mu_vec, ord=1) - linear_term)
+
+    constraints = ({'type': 'eq', 'fun': lambda mu_vec: float(np.dot(k2_eff, mu_vec) - 1.0)},)
+    bounds = [(0.0, None) for _ in range(k2_eff.size)]
+    res = minimize(
+        objective,
+        mu_init,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 200, "ftol": 1e-9, "disp": False},
+    )
+
+    if res.x is None:
+        mu_vec = np.asarray(mu_init, dtype=np.float64)
+    else:
+        mu_vec = np.maximum(np.asarray(res.x, dtype=np.float64), 0.0)
+    denom = float(np.dot(k2_eff, mu_vec))
+    if denom <= eps:
+        mu_vec = np.asarray(mu_init, dtype=np.float64)
+        denom = float(np.dot(k2_eff, mu_vec))
+    mu_vec = mu_vec / max(denom, eps)
+    return mu_vec
 
 
 def optimize_beam_ris(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, link_switch=(1, 0), user_weights=None,
-                      update_vars=None, tx_power=0.1, noise_std=0.1, var_floor=1e-3, eps=1e-8):
+                      update_vars=None, tx_power=0.1, noise_std=0.1, var_floor=1e-3, eps=1e-8, oa_iters=5):
     """
     OTA-aware heuristic aligned with the current AirComp simulator.
     It uses the current round update variances to maximize the weakest-user eta:
@@ -135,7 +111,7 @@ def optimize_beam_ris(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, lin
     f_vec = _normalize_vector(f_init if f_init is not None else np.ones(M, dtype=np.complex64))
     theta_vec = np.asarray(theta_init, dtype=np.complex64) if theta_init is not None else np.ones(N, dtype=np.complex64)
 
-    iterations = 5
+    iterations = int(max(1, oa_iters))
     for _ in range(iterations):
         g_vec, h_eff, hk_list = _compute_effective_channels(
             H_BR, h_RUs, f_vec, theta_vec, h_BUs, reflect_on, direct_on
@@ -169,26 +145,25 @@ def optimize_beam_ris(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, lin
         f_vec = _normalize_vector(f_vec, fallback=f_init)
 
     _, h_eff, _ = _compute_effective_channels(H_BR, h_RUs, f_vec, theta_vec, h_BUs, reflect_on, direct_on)
-    inner2 = np.abs(h_eff) ** 2 + eps
-    eta_candidates = tx_power * inner2 / (np.square(user_weights) * update_vars + eps)
-    eta = float(np.min(eta_candidates).real)
-    noise_power = float((noise_std ** 2) * tx_power)
-    nmse_proxy = noise_power / (eta * (np.square(user_weights.sum()) + eps))
+    _, _, nmse_proxy = _compute_eta_proxy(
+        h_eff=h_eff,
+        user_weights=user_weights,
+        update_vars=update_vars,
+        tx_power=tx_power,
+        noise_std=noise_std,
+        eps=eps,
+    )
 
     return f_vec.astype(np.complex64), theta_vec.astype(np.complex64), nmse_proxy
 
 
-def optimize_beam_ris_state_aware(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, link_switch=(1, 0),
-                                  user_weights=None, state_weights=None, update_vars=None, tx_power=0.1,
-                                  noise_std=0.1, var_floor=1e-3, ao_iters=2, theta_lr=0.05,
-                                  theta_grad_steps=1, normalize_f=True, eps=1e-8):
+def optimize_beam_ris_sca(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, link_switch=(1, 0), user_weights=None,
+                          update_vars=None, tx_power=0.1, noise_std=0.1, var_floor=1e-3, eps=1e-8,
+                          sca_iters=100, sca_threshold=1e-2, sca_tau=1.0):
     """
-    State-aware OA optimization:
-      min_{f,theta} sum_k omega_k |f^H h_k^eff(theta) b_k - 1|^2 + noise_var ||f||^2
-      s.t. |theta_n|=1.
-
-    b_k is passed by user_weights (e.g., K_k normalization).
-    omega_k is passed by state_weights derived from slow+fast user states.
+    SCA version adapted from the reference `sca_fmincon()` implementation, but aligned
+    with the current OTA model by absorbing per-user update variance into the effective
+    denominator K_i^2 * var_i.
     """
     k_users, n_ris = h_RUs.shape
     m_bs = H_BR.shape[1]
@@ -196,62 +171,108 @@ def optimize_beam_ris_state_aware(H_BR, h_RUs, h_BUs=None, theta_init=None, f_in
 
     if user_weights is None:
         user_weights = np.ones(k_users, dtype=np.float32)
-    b_vec = np.asarray(user_weights, dtype=np.float32).reshape(-1).astype(np.complex64)
-    if b_vec.size != k_users:
-        raise ValueError(f"user_weights size mismatch: expected {k_users}, got {b_vec.size}")
-
-    if state_weights is None:
-        state_weights = np.ones(k_users, dtype=np.float32)
-    omega_vec = np.asarray(state_weights, dtype=np.float32).reshape(-1)
-    if omega_vec.size != k_users:
-        raise ValueError(f"state_weights size mismatch: expected {k_users}, got {omega_vec.size}")
-    omega_vec = np.maximum(omega_vec, 1e-6).astype(np.float64)
+    user_weights = np.asarray(user_weights, dtype=np.float64).reshape(-1)
 
     if update_vars is None:
         update_vars = np.ones(k_users, dtype=np.float32)
-    update_vars = np.maximum(np.asarray(update_vars, dtype=np.float32), float(var_floor))
+    update_vars = np.maximum(np.asarray(update_vars, dtype=np.float64).reshape(-1), float(var_floor))
+    k2_eff = np.maximum(np.square(user_weights) * update_vars, eps)
 
-    f_vec = _normalize_vector(f_init if f_init is not None else np.ones(m_bs, dtype=np.complex64))
-    if theta_init is None:
-        theta_vec = np.ones(n_ris, dtype=np.complex64)
+    h_direct, g_maps = _build_affine_channel_maps(H_BR, h_RUs, h_BUs, reflect_on, direct_on)
+
+    if reflect_on:
+        if theta_init is None:
+            theta_vec = np.ones((n_ris,), dtype=np.complex128)
+        else:
+            theta_arr = np.asarray(theta_init, dtype=np.complex128).reshape(-1)
+            theta_vec = np.exp(1j * np.angle(theta_arr))
     else:
-        theta_vec = np.exp(1j * np.angle(np.asarray(theta_init, dtype=np.complex64))).astype(np.complex64)
+        theta_vec = np.zeros((n_ris,), dtype=np.complex128)
 
-    noise_var = float(noise_std ** 2)
-    for _ in range(int(max(1, ao_iters))):
-        hk_list = _build_hk_list(H_BR, h_RUs, theta_vec, h_BUs, reflect_on, direct_on)
-        f_vec = _update_f_closed_form(
-            hk_list=hk_list,
-            b_vec=b_vec,
-            omega_vec=omega_vec,
-            noise_var=noise_var,
-            eps=eps,
-            normalize_f=bool(normalize_f),
-            f_fallback=f_init,
-        )
-        theta_vec = _update_theta_phase_gradient(
-            H_BR=H_BR,
-            h_RUs=h_RUs,
-            h_BUs=h_BUs,
-            f_vec=f_vec,
-            theta_vec=theta_vec,
-            b_vec=b_vec,
-            omega_vec=omega_vec,
-            reflect_on=reflect_on,
-            direct_on=direct_on,
-            theta_lr=theta_lr,
-            theta_grad_steps=theta_grad_steps,
-        )
+    h_stack = np.zeros((m_bs, k_users), dtype=np.complex128)
+    for user_idx in range(k_users):
+        h_stack[:, user_idx] = h_direct[:, user_idx] + g_maps[:, :, user_idx] @ theta_vec
 
-    hk_final = _build_hk_list(H_BR, h_RUs, theta_vec, h_BUs, reflect_on, direct_on)
-    obj_val = _compute_state_aware_objective(hk_final, f_vec, b_vec, omega_vec, noise_var)
-    h_eff = np.asarray([f_vec.conj().dot(hk) for hk in hk_final], dtype=np.complex64)
-    inner2 = np.abs(h_eff) ** 2 + eps
-    eta_candidates = tx_power * inner2 / (np.square(np.abs(b_vec)) * update_vars + eps)
-    eta = float(np.min(eta_candidates).real)
-    noise_power = float((noise_std ** 2) * tx_power)
-    nmse_proxy = noise_power / (eta * (np.square(np.sum(np.abs(b_vec))) + eps))
+    if f_init is None:
+        f_seed = h_stack[:, 0]
+    else:
+        f_seed = np.asarray(f_init, dtype=np.complex128).reshape(-1)
+    f_vec = _normalize_vector(f_seed).astype(np.complex128)
 
-    # Keep objective available to callers that need diagnostics in the future.
-    _ = obj_val
-    return f_vec.astype(np.complex64), theta_vec.astype(np.complex64), float(nmse_proxy)
+    mu_vec = 1.0 / (k_users * k2_eff)
+    obj_prev = float(np.min(np.abs(np.conj(f_vec) @ h_stack) ** 2 / k2_eff))
+
+    for _ in range(int(max(1, sca_iters))):
+        f_outer = np.outer(f_vec, np.conj(f_vec))
+        a_mat = np.zeros((m_bs, k_users), dtype=np.complex128)
+        b_mat = np.zeros((n_ris, k_users), dtype=np.complex128)
+        c_vec = np.zeros((k_users,), dtype=np.float64)
+
+        for user_idx in range(k_users):
+            hk = h_stack[:, user_idx]
+            gain = float(np.abs(np.conj(f_vec) @ hk) ** 2)
+            a_mat[:, user_idx] = float(sca_tau) * k2_eff[user_idx] * f_vec + np.outer(hk, np.conj(hk)) @ f_vec
+            if reflect_on:
+                gk = g_maps[:, :, user_idx]
+                b_mat[:, user_idx] = float(sca_tau) * k2_eff[user_idx] * theta_vec + gk.conj().T @ f_outer @ hk
+                c_vec[user_idx] = (
+                    gain
+                    + 2.0 * float(sca_tau) * k2_eff[user_idx] * (n_ris + 1.0)
+                    + 2.0 * np.real(theta_vec.conj().T @ gk.conj().T @ f_outer @ hk)
+                )
+            else:
+                c_vec[user_idx] = gain + 2.0 * float(sca_tau) * k2_eff[user_idx]
+
+        mu_vec = _solve_sca_mu(a_mat, b_mat, c_vec, k2_eff, mu_vec, eps)
+
+        f_candidate = a_mat @ mu_vec
+        f_vec = _normalize_vector(f_candidate, fallback=f_vec).astype(np.complex128)
+
+        if reflect_on:
+            theta_candidate = b_mat @ mu_vec
+            mag = np.abs(theta_candidate)
+            theta_safe = np.ones_like(theta_candidate, dtype=np.complex128)
+            valid = mag > eps
+            theta_safe[valid] = theta_candidate[valid] / mag[valid]
+            theta_vec = theta_safe
+
+        for user_idx in range(k_users):
+            h_stack[:, user_idx] = h_direct[:, user_idx] + g_maps[:, :, user_idx] @ theta_vec
+
+        obj_new = float(np.min(np.abs(np.conj(f_vec) @ h_stack) ** 2 / k2_eff))
+        rel_gap = np.abs(obj_new - obj_prev) / max(1.0, np.abs(obj_new))
+        obj_prev = obj_new
+        if rel_gap <= float(sca_threshold):
+            break
+
+    _, h_eff, _ = _compute_effective_channels(
+        H_BR,
+        h_RUs,
+        f_vec.astype(np.complex64),
+        theta_vec.astype(np.complex64),
+        h_BUs,
+        reflect_on,
+        direct_on,
+    )
+    _, _, nmse_proxy = _compute_eta_proxy(
+        h_eff=h_eff,
+        user_weights=user_weights,
+        update_vars=update_vars,
+        tx_power=tx_power,
+        noise_std=noise_std,
+        eps=eps,
+    )
+    return f_vec.astype(np.complex64), theta_vec.astype(np.complex64), nmse_proxy
+
+
+def optimize_beam_ris_by_mode(mode="oa", **kwargs):
+    optimizer_mode = str(mode).strip().lower()
+    if optimizer_mode == "oa":
+        kwargs.pop("sca_iters", None)
+        kwargs.pop("sca_threshold", None)
+        kwargs.pop("sca_tau", None)
+        return optimize_beam_ris(**kwargs)
+    if optimizer_mode == "sca":
+        kwargs.pop("oa_iters", None)
+        return optimize_beam_ris_sca(**kwargs)
+    raise ValueError("optimizer mode must be 'oa' or 'sca'")

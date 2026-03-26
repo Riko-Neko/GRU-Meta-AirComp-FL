@@ -3,12 +3,17 @@ import numpy as np
 
 def generate_pilot_pattern(P, N):
     """
-    Generate a pilot phase pattern matrix of shape (P, N) for RIS.
+    Generate a deterministic DFT-codebook pilot phase pattern matrix of shape (P, N) for RIS.
     Each row corresponds to one pilot transmission configuration of RIS phases.
+    Entries are unit-modulus complex phases suitable for phase-only RIS control.
     """
-    # Random continuous phase pattern
-    pattern = np.exp(1j * 2 * np.pi * np.random.rand(P, N))
-    return pattern
+    if P <= 0 or N <= 0:
+        raise ValueError(f"Pilot/codebook dimensions must be positive, got P={P}, N={N}")
+
+    row_idx = np.arange(P, dtype=np.float64)[:, None]
+    col_idx = np.arange(N, dtype=np.float64)[None, :]
+    pattern = np.exp(-1j * 2.0 * np.pi * (row_idx % N) * col_idx / float(N))
+    return pattern.astype(np.complex64)
 
 
 def simulate_pilot_observation(H_BR, h_RU, f_beam, theta_pattern, noise_std=0.0, *, h_BU=None, link_switch=(1, 0)):

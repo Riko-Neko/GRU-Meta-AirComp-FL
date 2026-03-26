@@ -2,6 +2,12 @@
 *.png
 *.pdf
 log/
+figs/
 .idea
 .DS_Store
 __pycache__
+
+# Ignore debug artifacts by default, but keep Python analysis scripts trackable.
+debug/**
+!debug/**/
+!debug/**/*.py

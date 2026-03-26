@@ -6,8 +6,9 @@ user-mobility model:
 
 - user positions evolve from initial coordinates and velocity vectors;
 - path-loss is recomputed from the updated positions every step;
-- small-scale fading still follows the existing positive-correlation AR(1)/OU
-  style evolution so split-step `t -> t+tau -> t+1` semantics remain intact.
+- small-scale fading follows a mobility-driven, first-order-correlation-matched
+  complex AR(1) approximation, with Jakes/J0 correlation used to map user
+  speed into per-step correlation coefficients.
 """
 
 from __future__ import annotations
@@ -21,6 +22,23 @@ import numpy as np
 
 _C_LIGHT = 299_792_458.0
 _RIS_PATHLOSS_POWER = 2.0
+
+
+def _bessel_j0(x) -> np.ndarray:
+    """
+    Numerical J0 approximation via the integral representation:
+        J0(x) = (1 / pi) * integral_0^pi cos(x sin(theta)) dtheta
+    This avoids adding a scipy dependency while remaining accurate enough for
+    the mobility ranges used in this project.
+    """
+    x_arr = np.asarray(x, dtype=np.float64)
+    flat = np.abs(x_arr.reshape(-1))
+    if flat.size == 0:
+        return np.asarray(x_arr, dtype=np.float64)
+    theta = np.linspace(0.0, math.pi, num=512, dtype=np.float64)
+    integrand = np.cos(flat[:, None] * np.sin(theta)[None, :])
+    vals = np.trapz(integrand, theta, axis=1) / math.pi
+    return vals.reshape(x_arr.shape)
 
 
 @dataclass
@@ -89,8 +107,8 @@ class MobilityDrivenChannelEvolver:
     Explicit user-mobility channel model.
 
     Large-scale fading is recomputed from positions every step, while
-    small-scale fading uses a positive AR(1)/OU evolution with alpha mapped
-    from user speed.
+    small-scale fading uses a user-level first-order-correlation-matched
+    complex AR(1) evolution with Jakes/J0 correlation mapped from user speed.
     """
 
     def __init__(self, cfg: MobilityDrivenChannelConfig):
@@ -111,6 +129,7 @@ class MobilityDrivenChannelEvolver:
         self.moving_user_ids = (np.flatnonzero(self.moving_user_mask).astype(np.int64) + 1).tolist()
         self.velocity_vectors = self._sample_velocity_vectors()
         self.speed_magnitudes = np.linalg.norm(self.velocity_vectors, axis=1)
+        self.doppler_hz = self._speed_to_doppler(self.speed_magnitudes)
         self.alpha_delta = self._speed_to_alpha(self.speed_magnitudes)
 
     def _validate(self) -> None:
@@ -197,17 +216,8 @@ class MobilityDrivenChannelEvolver:
         return ratio
 
     @staticmethod
-    def _fractional_alpha(alpha_delta: np.ndarray, step_ratio: float) -> np.ndarray:
-        ratio = float(step_ratio)
-        if ratio <= 0.0:
-            return np.ones_like(alpha_delta, dtype=np.float64)
-        if ratio >= 1.0:
-            return np.asarray(alpha_delta, dtype=np.float64).copy()
-        return np.power(np.asarray(alpha_delta, dtype=np.float64), ratio)
-
-    @staticmethod
     def _clip_alpha(alpha: np.ndarray) -> np.ndarray:
-        return np.clip(np.asarray(alpha, dtype=np.float64), 0.0, 0.999999)
+        return np.clip(np.asarray(alpha, dtype=np.float64), -0.999999, 0.999999)
 
     def _sample_cluster_ids(self) -> np.ndarray:
         counts = _allocate_counts_by_ratio(int(self.cfg.num_users), self.cfg.user_cluster_ratios)
@@ -242,10 +252,17 @@ class MobilityDrivenChannelEvolver:
             velocities[user_idx] = signed_speed * np.array([math.cos(direction), math.sin(direction)], dtype=np.float64)
         return velocities
 
-    def _speed_to_alpha(self, speed_magnitudes: np.ndarray) -> np.ndarray:
-        doppler_hz = np.asarray(speed_magnitudes, dtype=np.float64) * self.carrier_frequency_hz / _C_LIGHT
-        alpha = np.exp(-2.0 * math.pi * doppler_hz * self.time_step)
+    def _speed_to_doppler(self, speed_magnitudes: np.ndarray) -> np.ndarray:
+        return np.asarray(speed_magnitudes, dtype=np.float64) * self.carrier_frequency_hz / _C_LIGHT
+
+    def _speed_to_alpha_for_interval(self, speed_magnitudes: np.ndarray, interval_seconds: float) -> np.ndarray:
+        doppler_hz = self._speed_to_doppler(speed_magnitudes)
+        arg = 2.0 * math.pi * doppler_hz * float(interval_seconds)
+        alpha = _bessel_j0(arg)
         return self._clip_alpha(alpha)
+
+    def _speed_to_alpha(self, speed_magnitudes: np.ndarray) -> np.ndarray:
+        return self._speed_to_alpha_for_interval(speed_magnitudes, self.time_step)
 
     def positions_at(self, step_value: float) -> np.ndarray:
         return self.initial_positions + (self.velocity_vectors * (self.time_step * float(step_value)))
@@ -296,6 +313,9 @@ class MobilityDrivenChannelEvolver:
     def current_alpha_vector(self) -> np.ndarray:
         return self.alpha_delta.astype(np.float32, copy=False)
 
+    def current_doppler_vector(self) -> np.ndarray:
+        return self.doppler_hz.astype(np.float32, copy=False)
+
     def _complex_noise(self, shape: Tuple[int, ...]) -> np.ndarray:
         return (
             (np.random.randn(*shape) + 1j * np.random.randn(*shape))
@@ -318,7 +338,7 @@ class MobilityDrivenChannelEvolver:
             alpha_delta: np.ndarray,
     ) -> np.ndarray:
         g_current = self._remove_pathloss(current_h, pathloss_current)
-        beta = np.sqrt(np.maximum(0.0, 1.0 - alpha_delta * alpha_delta)).astype(np.float64)
+        beta = np.sqrt(np.maximum(0.0, 1.0 - np.square(np.abs(alpha_delta)))).astype(np.float64)
         noise = self._complex_noise(current_h.shape)
         g_next = (alpha_delta[:, None] * g_current) + (beta[:, None] * noise)
         return self._apply_pathloss(g_next, pathloss_target)
@@ -329,21 +349,39 @@ class MobilityDrivenChannelEvolver:
             pathloss_current: np.ndarray,
             pathloss_tau: np.ndarray,
             pathloss_next: np.ndarray,
+            alpha_tau: np.ndarray,
             alpha_delta: np.ndarray,
-            tau_ratio: float,
+            alpha_rem: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        rho = self._validate_step_ratio(tau_ratio)
         g_current = self._remove_pathloss(current_h, pathloss_current)
-        alpha_tau = self._fractional_alpha(alpha_delta, rho)
-        alpha_rem = self._fractional_alpha(alpha_delta, 1.0 - rho)
-
-        beta_tau = np.sqrt(np.maximum(0.0, 1.0 - alpha_tau * alpha_tau)).astype(np.float64)
         noise_tau = self._complex_noise(current_h.shape)
+        noise_next = self._complex_noise(current_h.shape)
+
+        beta_tau = np.sqrt(np.maximum(0.0, 1.0 - np.square(np.abs(alpha_tau)))).astype(np.float64)
         g_tau = (alpha_tau[:, None] * g_current) + (beta_tau[:, None] * noise_tau)
 
-        beta_rem = np.sqrt(np.maximum(0.0, 1.0 - alpha_rem * alpha_rem)).astype(np.float64)
-        noise_rem = self._complex_noise(current_h.shape)
-        g_next = (alpha_rem[:, None] * g_tau) + (beta_rem[:, None] * noise_rem)
+        g_next = np.empty_like(g_current)
+        near_static_tau = beta_tau < 1e-8
+        if np.any(near_static_tau):
+            beta_delta = np.sqrt(np.maximum(0.0, 1.0 - np.square(np.abs(alpha_delta[near_static_tau])))).astype(np.float64)
+            g_next[near_static_tau] = (
+                alpha_delta[near_static_tau, None] * g_current[near_static_tau]
+                + beta_delta[:, None] * noise_next[near_static_tau]
+            )
+        if np.any(~near_static_tau):
+            beta_tau_safe = beta_tau[~near_static_tau]
+            coupling = (
+                alpha_rem[~near_static_tau] - alpha_tau[~near_static_tau] * alpha_delta[~near_static_tau]
+            ) / beta_tau_safe
+            residual_var = np.maximum(
+                0.0,
+                1.0 - np.square(np.abs(alpha_delta[~near_static_tau])) - np.square(np.abs(coupling)),
+            )
+            g_next[~near_static_tau] = (
+                alpha_delta[~near_static_tau, None] * g_current[~near_static_tau]
+                + coupling[:, None] * noise_tau[~near_static_tau]
+                + np.sqrt(residual_var)[:, None] * noise_next[~near_static_tau]
+            )
 
         h_tau = self._apply_pathloss(g_tau, pathloss_tau)
         h_next = self._apply_pathloss(g_next, pathloss_next)
@@ -382,6 +420,8 @@ class MobilityDrivenChannelEvolver:
         positions_tau = self.positions_at(float(round_idx - 1) + rho)
         positions_next = self.positions_at(float(round_idx))
         alpha_delta = self.alpha_delta.copy()
+        alpha_tau = self._speed_to_alpha_for_interval(self.speed_magnitudes, rho * self.time_step)
+        alpha_rem = self._speed_to_alpha_for_interval(self.speed_magnitudes, (1.0 - rho) * self.time_step)
 
         pl_ris_current = self.ris_pathloss(positions_current)
         pl_ris_tau = self.ris_pathloss(positions_tau)
@@ -391,8 +431,9 @@ class MobilityDrivenChannelEvolver:
             pl_ris_current,
             pl_ris_tau,
             pl_ris_next,
+            alpha_tau,
             alpha_delta,
-            rho,
+            alpha_rem,
         )
 
         h_bu_tau = None
@@ -406,8 +447,9 @@ class MobilityDrivenChannelEvolver:
                 pl_direct_current,
                 pl_direct_tau,
                 pl_direct_next,
+                alpha_tau,
                 alpha_delta,
-                rho,
+                alpha_rem,
             )
 
         return UserChannelStepResult(
@@ -430,7 +472,13 @@ class MobilityDrivenChannelEvolver:
         rho = self._validate_step_ratio(tau_ratio)
         user = int(user_idx)
         alpha_delta = float(self.alpha_delta[user])
-        alpha_tau = float(self._fractional_alpha(np.asarray([alpha_delta], dtype=np.float64), rho)[0])
+        alpha_tau = float(self._speed_to_alpha_for_interval(np.asarray([self.speed_magnitudes[user]], dtype=np.float64), rho * self.time_step)[0])
+        alpha_rem = float(
+            self._speed_to_alpha_for_interval(
+                np.asarray([self.speed_magnitudes[user]], dtype=np.float64),
+                (1.0 - rho) * self.time_step,
+            )[0]
+        )
 
         positions_current = self.positions_at(float(round_idx - 1))[user:user + 1]
         positions_tau = self.positions_at(float(round_idx - 1) + rho)[user:user + 1]
@@ -441,8 +489,9 @@ class MobilityDrivenChannelEvolver:
             self.ris_pathloss(positions_current),
             self.ris_pathloss(positions_tau),
             self.ris_pathloss(positions_next),
+            np.asarray([alpha_tau], dtype=np.float64),
             np.asarray([alpha_delta], dtype=np.float64),
-            rho,
+            np.asarray([alpha_rem], dtype=np.float64),
         )
 
         h_bu_tau = None
@@ -453,8 +502,9 @@ class MobilityDrivenChannelEvolver:
                 self.direct_pathloss(positions_current),
                 self.direct_pathloss(positions_tau),
                 self.direct_pathloss(positions_next),
+                np.asarray([alpha_tau], dtype=np.float64),
                 np.asarray([alpha_delta], dtype=np.float64),
-                rho,
+                np.asarray([alpha_rem], dtype=np.float64),
             )
             h_bu_tau = h_bu_tau[0]
             h_bu_next = h_bu_next[0]
