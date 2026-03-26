@@ -90,6 +90,8 @@ The GRU branch has four details that matter for understanding current results:
 - When `enable_gru_pl_factorization=True`, the GRU adds a separate path-loss head (`head_pl`) on top of the same backbone. That scalar is predicted in a bounded log-domain range and trained with a SmoothL1 loss.
 - In persistent-hidden mode, local GRU training uses multiple same-round observations conditioned on the previous round hidden state, then runs one canonical inference step to update the hidden state that will be carried into the next round.
 
+When `meta_algorithm=Reptile`, the server only meta-updates the shared GRU backbone, so the local `t/tau` CSI heads and optional path-loss head are coupled through one shared meta-learned representation rather than through a shared prediction head. In the current GRU pipeline, that shared representation is used to jointly expose a slow semantic variable from predicted RIS path-loss (`beta_hat`) and a fast semantic variable from the `t -> tau` channel change (`d_hat`). Those long/short-range proxies are then passed to the grouping optimizer to decide when grouping should start and how user memberships should be updated over time.
+
 The grouped aggregation mechanism is specific to the GRU branch:
 
 - Before switching, there is one shared global backbone for all users.
