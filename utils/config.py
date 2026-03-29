@@ -23,16 +23,16 @@ class Config:
     # Mobility-driven synthetic geometry
     bs_position_xy = [0.0, 0.0]
     ris_position_xy = [30.0, 0.0]
-    # user_cluster_ratios = [0.5, 0.5]  # near / far user clusters
-    user_cluster_ratios = [1]  # near / far user clusters
-    # user_cluster_centers_xy = [[40.0, 8.0], [80.0, -12.0]]
-    # user_cluster_position_jitter_xy = [[10.0, 10.0], [10.0, 10.0]]
-    user_cluster_centers_xy = [[50.0, 0.0]]
-    user_cluster_position_jitter_xy = [[10.0, 10.0]]
-    user_speed_range = [10, 20]  # m/s; sampled per-user, then combined with a random direction
+    user_cluster_ratios = [0.5, 0.5]  # near / far user clusters
+    # user_cluster_ratios = [1]  # near / far user clusters
+    user_cluster_centers_xy = [[40.0, 8.0], [80.0, -12.0]]
+    user_cluster_position_jitter_xy = [[10.0, 10.0], [10.0, 10.0]]
+    # user_cluster_centers_xy = [[50.0, 0.0]]
+    # user_cluster_position_jitter_xy = [[10.0, 10.0]]
+    user_speed_range = [1, 5]  # m/s; sampled per-user, then combined with a random direction
     user_motion_direction_deg = None  # None=random direction per-user; float=fixed direction for all users
     # user_speed_user_mask = []  # 1 means all users move; list of 1-based user ids moves only those users
-    user_speed_user_mask = [9, 10]
+    user_speed_user_mask = [7, 8, 9, 10]
     channel_time_step = 1e-3  # seconds between consecutive channel samples
     channel_carrier_frequency_hz = 3.5e9
     channel_min_distance = 1.0
@@ -61,13 +61,13 @@ class Config:
     hidden_reset_update_norm_threshold = 0.5
 
     # Literature-style CNN baseline settings
-    enable_cnn_baseline = False
+    enable_cnn_baseline = True
     cnn_baseline_conv_filters = 8
     cnn_baseline_conv_kernel = 3
     cnn_baseline_hidden_size = 32
 
     # Formula-based LMMSE baseline on current pilots, evaluated with hold-last uplink CSI.
-    enable_lmmse_baseline = False
+    enable_lmmse_baseline = True
     lmmse_prior_var = 1.0
 
     # Pure architecture ablation (replace GRU backbone with non-stateful CNN)
@@ -97,11 +97,11 @@ class Config:
     gru_pl_loss_weight = 0.05
     gru_pl_eps = 1e-12
     enable_gru_semantic_grouping = True
-    gru_group_switch_min_round = 20
+    gru_group_switch_min_round = 10
     gru_group_switch_patience = 3
     gru_group_switch_ema_lambda = 0.8
-    gru_group_switch_tau_b = 0.05
-    gru_group_switch_tau_d = 0.05
+    gru_group_switch_tau_b = 0.08
+    gru_group_switch_tau_d = 0.08
     gru_group_eps = 1e-8
     gru_group_freeze_after_switch = True
     gru_groupwise_standardization = True
@@ -135,9 +135,10 @@ class Config:
     ota_var_floor = 1e-3
     ota_eps = 1e-8
     ota_noise_std = noise_std
+    ota_use_estimated_h_ru_for_aggregation = True  # if True, OTA h_eff uses branch-specific estimated h_RU; direct h_BU remains true
     ota_use_weighted_users = True  # if False, always use equal weights (all ones)
     oa_iters = 20
-    beam_ris_optimizer = "oa"  # "oa" | "sca"
+    beam_ris_optimizer = "sca"  # "oa" | "sca"
     sca_iters = 20
     sca_threshold = 1e-2
     sca_tau = 1.0
@@ -338,6 +339,7 @@ class Config:
             f"FL{cls._meta_abbrev()}_R{int(cls.num_rounds)}_E{int(cls.local_epochs)}_"
             f"B{batch_tag}_AIR{cls._slug_value(cls.use_aircomp)}_"
             f"SNR{cls._slug_value(cls.SNR_dB)}_TX{cls._slug_value(cls.ota_tx_power)}_"
+            f"OC{cls._slug_value(cls.ota_use_estimated_h_ru_for_aggregation)}_"
             f"VF{cls._slug_value(cls.ota_var_floor)}_EPS{cls._slug_value(cls.ota_eps)}_"
             f"PF{cls._slug_value(cls.enable_gru_pl_factorization)}W{cls._slug_value(cls.gru_pl_loss_weight)}_"
             f"GG{cls._slug_value(cls.enable_gru_semantic_grouping)}F{cls._slug_value(cls.gru_group_freeze_after_switch)}_"

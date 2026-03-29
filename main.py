@@ -1114,12 +1114,17 @@ def _save_gru_state_delta_plot(delta_vectors, round_idx, out_dir, tag="gru_state
 def main():
     config = Config
     meta_algorithm = _parse_meta_algorithm(config.meta_algorithm)
+    ota_use_estimated_h_ru_for_aggregation = bool(getattr(config, "ota_use_estimated_h_ru_for_aggregation", False))
     logger = Logger(config=config) if config.log_to_file else Logger()
     # logger = Logger(config.log_file_path) if config.log_to_file else Logger()
     logger.info("Initializing simulation...")
     logger.info(f"Config fingerprint(full)={config.fingerprint()}")
     logger.info(f"Experiment prefix={config.log_prefix()}")
     logger.info(f"Optimizer tag={config.optimizer_tag()}")
+    logger.info(
+        "OTA aggregation h_RU source="
+        + ("estimated (branch-specific)" if ota_use_estimated_h_ru_for_aggregation else "true/oracle simulator")
+    )
     np.random.seed(0)
     torch.manual_seed(0)
 
@@ -2621,6 +2626,9 @@ def main():
         gru_group_user_weights = None
         h_RUs_ota = h_RUs_uplink if use_uplink_target else h_RUs
         h_BUs_ota = h_BUs_uplink if use_uplink_target else h_BUs
+        h_RUs_ota_gru = h_RUs_est if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
+        h_RUs_ota_arch = h_RUs_est_arch if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
+        h_RUs_ota_baseline = h_RUs_est_baseline if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
         if config.use_aircomp and aircomp_sim is not None:
             if gru_group_mode == "single":
                 casc_pref = f_beam.conj() @ H_BR.T
@@ -2629,7 +2637,7 @@ def main():
                     direct = f_beam.conj().dot(h_BUs_ota[k]) if (direct_on == 1 and h_BUs_ota is not None) else 0.0
                     reflect = 0.0
                     if reflect_on == 1:
-                        reflect = np.dot(theta_ota, casc_pref * h_RUs_ota[k])
+                        reflect = np.dot(theta_ota, casc_pref * h_RUs_ota_gru[k])
                     h_eff_list.append(direct + reflect)
                 h_eff = torch.from_numpy(np.asarray(h_eff_list, dtype=np.complex64))
             else:
@@ -2643,7 +2651,7 @@ def main():
                     )
                     reflect_arch = 0.0
                     if reflect_on == 1:
-                        reflect_arch = np.dot(theta_ota_arch, casc_pref_arch * h_RUs_ota[k])
+                        reflect_arch = np.dot(theta_ota_arch, casc_pref_arch * h_RUs_ota_arch[k])
                     h_eff_list_arch.append(direct_arch + reflect_arch)
                 h_eff_arch = torch.from_numpy(np.asarray(h_eff_list_arch, dtype=np.complex64))
 
@@ -2656,7 +2664,7 @@ def main():
                     )
                     reflect_baseline = 0.0
                     if reflect_on == 1:
-                        reflect_baseline = np.dot(theta_ota_baseline, casc_pref_baseline * h_RUs_ota[k])
+                        reflect_baseline = np.dot(theta_ota_baseline, casc_pref_baseline * h_RUs_ota_baseline[k])
                     h_eff_list_baseline.append(direct_baseline + reflect_baseline)
                 h_eff_baseline = torch.from_numpy(np.asarray(h_eff_list_baseline, dtype=np.complex64))
         if config.use_aircomp and aircomp_sim is not None:
@@ -2736,7 +2744,7 @@ def main():
                         )
                         reflect = 0.0
                         if reflect_on == 1:
-                            reflect = np.dot(theta_group, casc_pref_group * h_RUs_ota[user_idx])
+                            reflect = np.dot(theta_group, casc_pref_group * h_RUs_ota_gru[user_idx])
                         h_eff_list_group.append(direct + reflect)
                     h_eff_group = torch.from_numpy(np.asarray(h_eff_list_group, dtype=np.complex64))
                     h_eff[user_ids_t] = h_eff_group
