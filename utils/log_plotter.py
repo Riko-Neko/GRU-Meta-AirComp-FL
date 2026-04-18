@@ -1,7 +1,7 @@
 import math
 import os
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -9,12 +9,13 @@ ROUND_RE = re.compile(r"Round\s+(\d+)")
 MEAN_LOCAL_LOSS_RE = re.compile(r"Round\s+(\d+)\s+mean local loss\s*->\s*(.+)$")
 GRU_DUAL_HEAD_LOSS_RE = re.compile(r"Round\s+(\d+)\s+GRU dual-head local loss\s*->\s*(.+)$")
 ETA_RE = re.compile(r"eta=([0-9eE+.\-]+)")
+AGG_NMSE_RE = re.compile(r"agg_NMSE=([0-9eE+.\-]+)")
 AGG_ERR_RE = re.compile(r"agg_err=([0-9eE+.\-]+)")
 PROXY_NMSE_RE = re.compile(r"proxy_NMSE=([0-9eE+.\-]+)")
 UPLINK_TRUE_NMSE_RE = re.compile(r"uplink_true_NMSE=([0-9eE+.\-]+)")
 LOW_GROUP_NMSE_RE = re.compile(r"low\(n=\d+\)=([0-9eE+.\-]+)")
 HIGH_GROUP_NMSE_RE = re.compile(r"high\(n=\d+\)=([0-9eE+.\-]+)")
-BEAM_RIS_OPT_RE = re.compile(r"Beam/RIS optimizer=(OA|SCA)", re.IGNORECASE)
+BEAM_RIS_OPT_RE = re.compile(r"Beam/RIS optimizer=(OA|SCA|DC)", re.IGNORECASE)
 RUN_STAMP_RE = re.compile(r"^\d{8}-\d{6}-\d{6}$")
 LEGACY_LOG_SUFFIX_RE = re.compile(r"^(.*)_([0-9a-f]{12})$")
 EXP_HASH_SUFFIX_RE = re.compile(r"^(.*)_EXP[0-9a-f]+$", re.IGNORECASE)
@@ -27,9 +28,9 @@ MODEL_COLORS = {
     "LMMSE": "#d62728",
     "Oracle-true": "#ff7f0e",
 }
-OPT_COMPARE_ORDER = ("OA-GRU", "SCA-GRU")
+OPT_COMPARE_ORDER = ("DC-GRU", "SCA-GRU")
 OPT_COMPARE_COLORS = {
-    "OA-GRU": "#1f77b4",
+    "DC-GRU": "#1f77b4",
     "SCA-GRU": "#d62728",
 }
 GRU_GROUP_ORDER = ("GRU-low", "GRU-high")
@@ -50,6 +51,29 @@ GRU_GROUP_UPLINK_STYLES = {
     "GRU-high": {"linestyle": "-", "stroke_dasharray": None},
     "GRU-high-oracle": {"linestyle": "--", "stroke_dasharray": "6,4"},
 }
+PROXY_ORACLE_GAP_TITLE = "Proxy Oracle Gap"
+LINEAR_Y_TITLES = {PROXY_ORACLE_GAP_TITLE}
+PLOT_SPECS = (
+    ("Round Mean Local Loss", "01_round_mean_local_loss", MODEL_ORDER, MODEL_COLORS, None),
+    ("AirComp Eta", "02_aircomp_eta", MODEL_ORDER, MODEL_COLORS, None),
+    ("AirComp Aggregation NMSE", "03_aircomp_aggregation_nmse", MODEL_ORDER, MODEL_COLORS, None),
+    ("AirComp Aggregation Error", "04_aircomp_aggregation_error", MODEL_ORDER, MODEL_COLORS, None),
+    ("Proxy NMSE After Optimization", "05_proxy_nmse_after_optimization", MODEL_ORDER, MODEL_COLORS, None),
+    ("Uplink True NMSE", "06_uplink_true_nmse", UPLINK_MODEL_ORDER, MODEL_COLORS, None),
+    (
+        "GRU Group Uplink True NMSE",
+        "07_gru_group_uplink_true_nmse",
+        GRU_GROUP_UPLINK_ORDER,
+        GRU_GROUP_UPLINK_COLORS,
+        GRU_GROUP_UPLINK_STYLES,
+    ),
+    ("DC vs SCA Uplink True NMSE", "08_dc_vs_sca_uplink_true_nmse", OPT_COMPARE_ORDER, OPT_COMPARE_COLORS, None),
+    ("GRU Group Proxy NMSE", "09_gru_group_proxy_nmse", GRU_GROUP_ORDER, GRU_GROUP_COLORS, None),
+    (PROXY_ORACLE_GAP_TITLE, "10_proxy_oracle_gap", UPLINK_MODEL_ORDER, MODEL_COLORS, None),
+)
+COMMON_PROXY_UPDATE_CSV = "05_proxy_nmse_after_optimization_common_update_vars.csv"
+COMMON_PROXY_DISPLAY_TITLE = "Proxy NMSE After Optimization (common GRU update variance)"
+PROXY_ORACLE_GAP_DISPLAY_TITLE = "Proxy Oracle Gap to Oracle (dB)"
 
 
 def _strip_ansi(text: str) -> str:
@@ -144,11 +168,15 @@ def _pair_prefix_and_optimizer_from_path(log_path: str, default_optimizer: Optio
             return prefix, "oa"
         if optimizer_tag.startswith("SCA-"):
             return prefix, "sca"
+        if optimizer_tag.startswith("DC-"):
+            return prefix, "dc"
         if optimizer_tag.startswith("O"):
             return prefix, "oa"
         if optimizer_tag.startswith("S"):
             return prefix, "sca"
-        if default_optimizer in {"oa", "sca"}:
+        if optimizer_tag.startswith("D"):
+            return prefix, "dc"
+        if default_optimizer in {"oa", "sca", "dc"}:
             return prefix, default_optimizer
     legacy_prefix = _log_prefix_stem(log_path)
     return legacy_prefix, default_optimizer
@@ -169,6 +197,7 @@ def _proxy_model_order(enable_cnn_arch: bool, enable_cnn_baseline: bool, enable_
 def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
     round_local_loss: Dict[str, Dict[int, float]] = {}
     round_eta: Dict[str, Dict[int, float]] = {}
+    round_agg_nmse: Dict[str, Dict[int, float]] = {}
     round_agg_err: Dict[str, Dict[int, float]] = {}
     round_proxy_nmse: Dict[str, Dict[int, float]] = {}
     round_uplink_true_nmse: Dict[str, Dict[int, float]] = {}
@@ -244,6 +273,9 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
                 m_eta = ETA_RE.search(msg)
                 if m_eta:
                     _append_metric(round_eta, model_aircomp, current_round, float(m_eta.group(1)))
+                m_agg_nmse = AGG_NMSE_RE.search(msg)
+                if m_agg_nmse:
+                    _append_metric(round_agg_nmse, model_aircomp, current_round, float(m_agg_nmse.group(1)))
                 m_agg_err = AGG_ERR_RE.search(msg)
                 if m_agg_err:
                     _append_metric(round_agg_err, model_aircomp, current_round, float(m_agg_err.group(1)))
@@ -301,6 +333,7 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
     return {
         "Round Mean Local Loss": round_local_loss,
         "AirComp Eta": round_eta,
+        "AirComp Aggregation NMSE": round_agg_nmse,
         "AirComp Aggregation Error": round_agg_err,
         "Proxy NMSE After Optimization": round_proxy_nmse,
         "Uplink True NMSE": round_uplink_true_nmse,
@@ -366,6 +399,17 @@ def _lift_nonpositive_for_log(points: Dict[int, float], floor: float = 1e-15) ->
     for round_idx, value in points.items():
         lifted[round_idx] = value if value > 0 else floor
     return lifted
+
+
+def _display_title(metrics: Dict[str, object], title: str) -> str:
+    titles = metrics.get("_plot_titles", {})
+    if isinstance(titles, dict):
+        display = str(titles.get(title, title))
+        if display != title:
+            return display
+    if title == PROXY_ORACLE_GAP_TITLE:
+        return PROXY_ORACLE_GAP_DISPLAY_TITLE
+    return title
 
 
 def _svg_panel(
@@ -501,9 +545,9 @@ def _read_optimizer_mode_from_log(log_path: str) -> Optional[str]:
 def _find_optimizer_pair_log(log_path: str, current_meta: Dict[str, Optional[str]]) -> Optional[str]:
     current_optimizer = current_meta.get("beam_ris_optimizer")
     pair_prefix = current_meta.get("log_pair_prefix")
-    if current_optimizer not in {"oa", "sca"} or not pair_prefix:
+    if current_optimizer not in {"dc", "sca"} or not pair_prefix:
         return None
-    target_optimizer = "sca" if current_optimizer == "oa" else "oa"
+    target_optimizer = "sca" if current_optimizer == "dc" else "dc"
     log_dir = os.path.dirname(log_path)
     candidates = []
     try:
@@ -538,13 +582,13 @@ def _build_optimizer_compare_metric(
     by_optimizer = {}
     for metrics in (current_metrics, paired_metrics):
         optimizer = metrics.get("_meta", {}).get("beam_ris_optimizer")
-        if optimizer in {"oa", "sca"}:
+        if optimizer in {"dc", "sca"}:
             by_optimizer[optimizer] = metrics
-    if "oa" not in by_optimizer or "sca" not in by_optimizer:
+    if "dc" not in by_optimizer or "sca" not in by_optimizer:
         return {}
 
     compare_metric: Dict[str, Dict[int, float]] = {}
-    for optimizer, prefix in (("oa", "OA"), ("sca", "SCA")):
+    for optimizer, prefix in (("dc", "DC"), ("sca", "SCA")):
         uplink_metric = by_optimizer[optimizer].get("Uplink True NMSE", {})
         gru_points = uplink_metric.get("GRU", {})
         if gru_points:
@@ -552,170 +596,135 @@ def _build_optimizer_compare_metric(
     return compare_metric
 
 
-def _render_svg(metrics: Dict[str, Dict[str, Dict[int, float]]], log_stem: str, out_path: str) -> str:
-    width, height = 1420, 1850
-    panels: Tuple[Tuple[int, int, int, int], ...] = (
-        (20, 42, 680, 420),
-        (720, 42, 680, 420),
-        (20, 500, 680, 420),
-        (720, 500, 680, 420),
-        (20, 958, 680, 420),
-        (720, 958, 680, 420),
-        (20, 1416, 680, 420),
-        (720, 1416, 680, 420),
-    )
-    titles = (
-        "Round Mean Local Loss",
-        "AirComp Eta",
-        "AirComp Aggregation Error",
-        "Proxy NMSE After Optimization",
-        "Uplink True NMSE",
-        "GRU Group Uplink True NMSE",
-        "OA vs SCA Uplink True NMSE",
-        "GRU Group Proxy NMSE",
-    )
+def _build_proxy_oracle_gap_metric(
+    proxy_metric: Dict[str, Dict[int, float]],
+) -> Dict[str, Dict[int, float]]:
+    oracle_points = proxy_metric.get("Oracle-true", {})
+    if not oracle_points:
+        return {}
 
-    chunks = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
-        '<rect x="0" y="0" width="100%" height="100%" fill="#f6f8fb"/>',
-        f'<text x="{width / 2}" y="26" text-anchor="middle" font-size="16" fill="#222">{_escape_xml(log_stem)}</text>',
-    ]
-
-    for i, title in enumerate(titles):
-        x, y, w, h = panels[i]
-        if title == "OA vs SCA Uplink True NMSE":
-            _svg_panel(
-                chunks,
-                metrics.get(title, {}),
-                title,
-                x,
-                y,
-                w,
-                h,
-                ylog=True,
-                model_order=OPT_COMPARE_ORDER,
-                model_colors=OPT_COMPARE_COLORS,
-            )
-        elif title == "GRU Group Uplink True NMSE":
-            _svg_panel(
-                chunks,
-                metrics.get(title, {}),
-                title,
-                x,
-                y,
-                w,
-                h,
-                ylog=True,
-                model_order=GRU_GROUP_UPLINK_ORDER,
-                model_colors=GRU_GROUP_UPLINK_COLORS,
-                model_styles=GRU_GROUP_UPLINK_STYLES,
-            )
-        elif title == "GRU Group Proxy NMSE":
-            _svg_panel(
-                chunks,
-                metrics.get(title, {}),
-                title,
-                x,
-                y,
-                w,
-                h,
-                ylog=True,
-                model_order=GRU_GROUP_ORDER,
-                model_colors=GRU_GROUP_COLORS,
-            )
-        elif title == "Uplink True NMSE":
-            _svg_panel(
-                chunks,
-                metrics.get(title, {}),
-                title,
-                x,
-                y,
-                w,
-                h,
-                ylog=True,
-                model_order=UPLINK_MODEL_ORDER,
-                model_colors=MODEL_COLORS,
-            )
-        else:
-            _svg_panel(chunks, metrics.get(title, {}), title, x, y, w, h, ylog=True)
-
-    chunks.append("</svg>")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(chunks))
-    return out_path
+    gap_metric: Dict[str, Dict[int, float]] = {}
+    for model in UPLINK_MODEL_ORDER:
+        model_points = proxy_metric.get(model, {})
+        if not model_points:
+            continue
+        model_gap = {}
+        for round_idx, value in model_points.items():
+            oracle_value = oracle_points.get(round_idx)
+            if value is None or oracle_value is None or value <= 0.0 or oracle_value <= 0.0:
+                continue
+            model_gap[round_idx] = abs(10.0 * math.log10(value) - 10.0 * math.log10(oracle_value))
+        if model_gap:
+            gap_metric[model] = model_gap
+    return gap_metric
 
 
-def _render_matplotlib(metrics: Dict[str, Dict[str, Dict[int, float]]], log_stem: str, out_path: str) -> Optional[str]:
+def _load_common_update_proxy_metric(out_dir: str) -> Optional[Dict[str, Dict[int, float]]]:
+    csv_path = os.path.join(out_dir, COMMON_PROXY_UPDATE_CSV)
+    if not os.path.isfile(csv_path):
+        return None
+
+    metric: Dict[str, Dict[int, float]] = {}
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            header = f.readline().strip().split(",")
+            if len(header) < 2 or header[0] != "round":
+                return None
+            models = header[1:]
+            for raw in f:
+                parts = raw.strip().split(",")
+                if len(parts) < 2 or not parts[0]:
+                    continue
+                try:
+                    round_idx = int(parts[0])
+                except ValueError:
+                    continue
+                for model, value_text in zip(models, parts[1:]):
+                    if model not in MODEL_ORDER or not value_text:
+                        continue
+                    try:
+                        value = float(value_text)
+                    except ValueError:
+                        continue
+                    if math.isfinite(value) and value > 0:
+                        metric.setdefault(model, {})[round_idx] = value
+    except OSError:
+        return None
+
+    return metric if any(metric.values()) else None
+
+
+def _remove_common_update_proxy_metric_csv(out_dir: str) -> None:
+    csv_path = os.path.join(out_dir, COMMON_PROXY_UPDATE_CSV)
+    try:
+        os.remove(csv_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _render_svg(metrics: Dict[str, Dict[str, Dict[int, float]]], log_stem: str, out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    width, height = 740, 520
+    for title, file_stem, model_order, model_colors, model_styles in PLOT_SPECS:
+        out_path = os.path.join(out_dir, f"{file_stem}.svg")
+        display_title = _display_title(metrics, title)
+        chunks = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+            '<rect x="0" y="0" width="100%" height="100%" fill="#f6f8fb"/>',
+            f'<text x="{width / 2}" y="26" text-anchor="middle" font-size="13" fill="#222">{_escape_xml(log_stem)}</text>',
+        ]
+        _svg_panel(
+            chunks,
+            metrics.get(title, {}),
+            display_title,
+            20,
+            54,
+            680,
+            420,
+            ylog=title not in LINEAR_Y_TITLES,
+            model_order=model_order,
+            model_colors=model_colors,
+            model_styles=model_styles,
+        )
+        chunks.append("</svg>")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(chunks))
+    return out_dir
+
+
+def _render_matplotlib(metrics: Dict[str, Dict[str, Dict[int, float]]], log_stem: str, out_dir: str) -> Optional[str]:
     try:
         import matplotlib.pyplot as plt
     except Exception:
         return None
 
-    fig, axes = plt.subplots(4, 2, figsize=(14, 17), constrained_layout=True)
-    titles = (
-        "Round Mean Local Loss",
-        "AirComp Eta",
-        "AirComp Aggregation Error",
-        "Proxy NMSE After Optimization",
-        "Uplink True NMSE",
-        "GRU Group Uplink True NMSE",
-        "OA vs SCA Uplink True NMSE",
-        "GRU Group Proxy NMSE",
-    )
-    flat_axes = list(axes.flat)
-    for ax, title in zip(flat_axes, titles):
-        if title == "OA vs SCA Uplink True NMSE":
-            _plot_metric_matplotlib(
-                ax,
-                metrics.get(title, {}),
-                title,
-                ylog=True,
-                model_order=OPT_COMPARE_ORDER,
-                model_colors=OPT_COMPARE_COLORS,
-            )
-        elif title == "GRU Group Uplink True NMSE":
-            _plot_metric_matplotlib(
-                ax,
-                metrics.get(title, {}),
-                title,
-                ylog=True,
-                model_order=GRU_GROUP_UPLINK_ORDER,
-                model_colors=GRU_GROUP_UPLINK_COLORS,
-                model_styles=GRU_GROUP_UPLINK_STYLES,
-            )
-        elif title == "GRU Group Proxy NMSE":
-            _plot_metric_matplotlib(
-                ax,
-                metrics.get(title, {}),
-                title,
-                ylog=True,
-                model_order=GRU_GROUP_ORDER,
-                model_colors=GRU_GROUP_COLORS,
-            )
-        elif title == "Uplink True NMSE":
-            _plot_metric_matplotlib(
-                ax,
-                metrics.get(title, {}),
-                title,
-                ylog=True,
-                model_order=UPLINK_MODEL_ORDER,
-                model_colors=MODEL_COLORS,
-            )
-        else:
-            _plot_metric_matplotlib(ax, metrics.get(title, {}), title, ylog=True)
-    for ax in flat_axes[len(titles):]:
-        ax.axis("off")
-    fig.suptitle(log_stem, fontsize=11)
-    fig.savefig(out_path, dpi=160)
-    plt.close(fig)
-    return out_path
+    os.makedirs(out_dir, exist_ok=True)
+    for title, file_stem, model_order, model_colors, model_styles in PLOT_SPECS:
+        out_path = os.path.join(out_dir, f"{file_stem}.png")
+        fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
+        display_title = _display_title(metrics, title)
+        _plot_metric_matplotlib(
+            ax,
+            metrics.get(title, {}),
+            display_title,
+            ylog=title not in LINEAR_Y_TITLES,
+            model_order=model_order,
+            model_colors=model_colors,
+            model_styles=model_styles,
+        )
+        fig.suptitle(log_stem, fontsize=9)
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)
+    return out_dir
 
 
 def _plot_round_metrics_from_log_impl(log_path: str, figs_root: str, *, refresh_pair: bool) -> Optional[str]:
     """
-    Parse round-level metrics from a training log and save one comparison figure.
+    Parse round-level metrics from a training log and save one directory of metric figures.
     Output path format:
-      ./figs/<log_filename_without_ext>.(png|svg)
+      ./figs/<log_filename_without_ext>/*.(png|svg)
     """
     if not os.path.isfile(log_path):
         return None
@@ -723,19 +732,32 @@ def _plot_round_metrics_from_log_impl(log_path: str, figs_root: str, *, refresh_
     metrics = _parse_log_metrics(log_path)
     paired_log_path = _find_optimizer_pair_log(log_path, metrics.get("_meta", {}))
     paired_metrics = _parse_log_metrics(paired_log_path) if paired_log_path is not None else None
-    metrics["OA vs SCA Uplink True NMSE"] = _build_optimizer_compare_metric(metrics, paired_metrics)
+    metrics["DC vs SCA Uplink True NMSE"] = _build_optimizer_compare_metric(metrics, paired_metrics)
     log_stem = os.path.splitext(os.path.basename(log_path))[0]
     os.makedirs(figs_root, exist_ok=True)
 
-    out_png = os.path.join(figs_root, f"{log_stem}.png")
-    png_path = _render_matplotlib(metrics, log_stem, out_png)
+    out_dir = os.path.join(figs_root, log_stem)
+    common_proxy_metric = _load_common_update_proxy_metric(out_dir)
+    if common_proxy_metric is not None:
+        metrics["Proxy NMSE After Optimization"] = common_proxy_metric
+        metrics["_plot_titles"] = {
+            "Proxy NMSE After Optimization": COMMON_PROXY_DISPLAY_TITLE,
+        }
+    metrics[PROXY_ORACLE_GAP_TITLE] = _build_proxy_oracle_gap_metric(
+        metrics.get("Proxy NMSE After Optimization", {})
+    )
+
+    png_path = _render_matplotlib(metrics, log_stem, out_dir)
     if png_path is not None:
+        if common_proxy_metric is not None:
+            _remove_common_update_proxy_metric_csv(out_dir)
         if refresh_pair and paired_log_path is not None:
             _plot_round_metrics_from_log_impl(paired_log_path, figs_root, refresh_pair=False)
         return png_path
 
-    out_svg = os.path.join(figs_root, f"{log_stem}.svg")
-    svg_path = _render_svg(metrics, log_stem, out_svg)
+    svg_path = _render_svg(metrics, log_stem, out_dir)
+    if common_proxy_metric is not None:
+        _remove_common_update_proxy_metric_csv(out_dir)
     if refresh_pair and paired_log_path is not None:
         _plot_round_metrics_from_log_impl(paired_log_path, figs_root, refresh_pair=False)
     return svg_path

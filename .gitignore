@@ -3,6 +3,8 @@
 *.pdf
 log/
 figs/
+!figs/
+!figs/*.py
 .idea
 .DS_Store
 __pycache__

@@ -33,6 +33,10 @@ from utils.eta_response_snapshot import build_eta_components, complex_nmse_per_u
 from utils.logger import Logger
 
 
+PROXY_PLOT_MODEL_ORDER = ("GRU", "CNN-arch", "CNN-base", "LMMSE", "Oracle-true")
+PROXY_COMMON_UPDATE_CSV = "05_proxy_nmse_after_optimization_common_update_vars.csv"
+
+
 def _parse_gru_target_mode(mode):
     token = str(mode).strip().lower().replace(" ", "")
     if token in {"t", "current", "now"}:
@@ -51,6 +55,17 @@ def _parse_meta_algorithm(mode):
     if token == "reptile":
         return "reptile"
     raise ValueError("Config.meta_algorithm must be 'FedAvg' or 'Reptile'")
+
+
+def _parse_nonnegative_float_grid(values, name):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError(f"Config.{name} must contain at least one value")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"Config.{name} must contain only finite values")
+    if np.any(arr < 0.0):
+        raise ValueError(f"Config.{name} must contain only nonnegative values")
+    return np.unique(arr)
 
 
 BRANCH_ANSI = {
@@ -391,6 +406,67 @@ def _complex_nmse(est, target, eps=1e-12):
     err_power = float(np.linalg.norm(est_arr - target_arr) ** 2)
     ref_power = float(np.linalg.norm(target_arr) ** 2)
     return err_power / (ref_power + float(eps))
+
+
+def _proxy_nmse_for_plot_common_update(
+    H_BR,
+    h_RUs,
+    h_BUs,
+    f_vec,
+    theta_vec,
+    link_switch,
+    user_weights,
+    update_vars,
+    tx_power,
+    noise_std,
+    eps,
+):
+    h_ru_arr = np.asarray(h_RUs, dtype=np.complex64)
+    if h_ru_arr.ndim != 2:
+        return None
+    H_arr = np.asarray(H_BR, dtype=np.complex64)
+    f_arr = np.asarray(f_vec, dtype=np.complex64).reshape(-1)
+    theta_arr = np.asarray(theta_vec, dtype=np.complex64).reshape(-1)
+    h_bu_arr = None if h_BUs is None else np.asarray(h_BUs, dtype=np.complex64)
+    weights = np.asarray(user_weights, dtype=np.float64).reshape(-1)
+    common_vars = np.asarray(update_vars, dtype=np.float64).reshape(-1)
+    if weights.size != h_ru_arr.shape[0] or common_vars.size != h_ru_arr.shape[0]:
+        return None
+
+    reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
+    h_eff = np.zeros((h_ru_arr.shape[0],), dtype=np.complex64)
+    for user_idx in range(h_ru_arr.shape[0]):
+        h_k = np.zeros((H_arr.shape[1],), dtype=np.complex64)
+        if reflect_on:
+            h_k = h_k + H_arr.conj().T.dot(theta_arr * h_ru_arr[user_idx])
+        if direct_on and h_bu_arr is not None:
+            h_k = h_k + h_bu_arr[user_idx]
+        h_eff[user_idx] = f_arr.conj().dot(h_k)
+
+    inner2 = np.abs(h_eff).astype(np.float64) ** 2 + float(eps)
+    eta_candidates = float(tx_power) * inner2 / (np.square(weights) * common_vars + float(eps))
+    eta = float(np.min(eta_candidates).real)
+    if not np.isfinite(eta) or eta <= 0.0:
+        return None
+    noise_power = float((noise_std ** 2) * tx_power)
+    return noise_power / (eta * (np.square(weights.sum()) + float(eps)))
+
+
+def _append_proxy_plot_common_update_csv(log_stem, round_idx, values, figs_root="./figs"):
+    if not log_stem or not values:
+        return
+    out_dir = os.path.join(figs_root, log_stem)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, PROXY_COMMON_UPDATE_CSV)
+    write_header = not os.path.exists(out_path)
+    with open(out_path, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write("round," + ",".join(PROXY_PLOT_MODEL_ORDER) + "\n")
+        fields = [str(int(round_idx))]
+        for model_name in PROXY_PLOT_MODEL_ORDER:
+            value = values.get(model_name)
+            fields.append("" if value is None or not np.isfinite(value) else f"{float(value):.12e}")
+        f.write(",".join(fields) + "\n")
 
 
 def _compute_standardization_stats(arrays, feature_ndim, eps=1e-6):
@@ -1170,6 +1246,35 @@ def main():
     gru_pl_snapshot_run_dir = None
     if gru_pl_snapshot_enabled:
         gru_pl_snapshot_run_dir = os.path.join(gru_pl_snapshot_root, logger.stem or config.log_prefix())
+    gru_group_switch_sensitivity_snapshot_enabled = bool(
+        getattr(config, "enable_gru_group_switch_sensitivity_snapshot", False)
+    )
+    gru_group_switch_sensitivity_snapshot_root = str(
+        getattr(config, "gru_group_switch_sensitivity_snapshot_root", "debug/gru_group_switch_sensitivity_snapshots")
+    )
+    gru_group_switch_sensitivity_snapshot_every = int(
+        getattr(config, "gru_group_switch_sensitivity_snapshot_every", 1)
+    )
+    if gru_group_switch_sensitivity_snapshot_every <= 0:
+        raise ValueError("Config.gru_group_switch_sensitivity_snapshot_every must be positive")
+    if gru_group_switch_sensitivity_snapshot_enabled:
+        gru_group_switch_sensitivity_tau_b_grid = _parse_nonnegative_float_grid(
+            getattr(config, "gru_group_switch_sensitivity_tau_b_values", [0.065]),
+            "gru_group_switch_sensitivity_tau_b_values",
+        )
+        gru_group_switch_sensitivity_tau_d_grid = _parse_nonnegative_float_grid(
+            getattr(config, "gru_group_switch_sensitivity_tau_d_values", [0.065]),
+            "gru_group_switch_sensitivity_tau_d_values",
+        )
+    else:
+        gru_group_switch_sensitivity_tau_b_grid = np.asarray([0.065], dtype=np.float64)
+        gru_group_switch_sensitivity_tau_d_grid = np.asarray([0.065], dtype=np.float64)
+    gru_group_switch_sensitivity_snapshot_run_dir = None
+    if gru_group_switch_sensitivity_snapshot_enabled:
+        gru_group_switch_sensitivity_snapshot_run_dir = os.path.join(
+            gru_group_switch_sensitivity_snapshot_root,
+            logger.stem or config.log_prefix(),
+        )
     debug_head_plot_run_dir = None
     debug_head_plot_gru_dir = None
     debug_head_plot_arch_dir = None
@@ -1261,6 +1366,13 @@ def main():
         raise ValueError("Config.gru_group_switch_tau_b/tau_d must be nonnegative")
     if gru_group_eps <= 0.0:
         raise ValueError("Config.gru_group_eps must be positive")
+    if gru_group_switch_sensitivity_snapshot_enabled:
+        gru_group_switch_sensitivity_tau_b_grid = np.unique(
+            np.concatenate([gru_group_switch_sensitivity_tau_b_grid, np.asarray([gru_group_switch_tau_b])])
+        )
+        gru_group_switch_sensitivity_tau_d_grid = np.unique(
+            np.concatenate([gru_group_switch_sensitivity_tau_d_grid, np.asarray([gru_group_switch_tau_d])])
+        )
     gru_grouping_cfg = _build_gru_grouping_config(config) if enable_gru_semantic_grouping else None
 
     ru_evolver = None
@@ -1405,6 +1517,10 @@ def main():
             raise ValueError("Eta-response snapshot requires a reflection-enabled link (direct-only mode unsupported)")
         if not use_uplink_target:
             raise ValueError("Eta-response snapshot requires gru_csi_target_mode in {'uplink_linear', 'uplink_direct'}")
+    if gru_group_switch_sensitivity_snapshot_enabled and not enable_gru_semantic_grouping:
+        raise ValueError(
+            "GRU group switch sensitivity snapshots require enable_gru_semantic_grouping=True"
+        )
     if gru_pl_snapshot_enabled:
         if not enable_gru_pl_factorization:
             raise ValueError("GRU PL debug snapshot requires enable_gru_pl_factorization=True")
@@ -1468,12 +1584,16 @@ def main():
             f"freeze_after_switch={gru_group_freeze_after_switch}"
         )
     beam_ris_optimizer = str(getattr(config, "beam_ris_optimizer", "oa")).strip().lower()
-    if beam_ris_optimizer not in {"oa", "sca"}:
-        raise ValueError("Config.beam_ris_optimizer must be 'oa' or 'sca'")
+    if beam_ris_optimizer not in {"oa", "sca", "dc"}:
+        raise ValueError("Config.beam_ris_optimizer must be 'oa', 'sca', or 'dc'")
     oa_iters = int(getattr(config, "oa_iters", 5))
     sca_iters = int(getattr(config, "sca_iters", 100))
     sca_threshold = float(getattr(config, "sca_threshold", 1e-2))
     sca_tau = float(getattr(config, "sca_tau", 1.0))
+    dc_outer_iters = int(getattr(config, "dc_outer_iters", 20))
+    dc_inner_iters = int(getattr(config, "dc_inner_iters", 50))
+    dc_tol = float(getattr(config, "dc_tol", 1e-3))
+    dc_inner_tol = float(getattr(config, "dc_inner_tol", 1e-8))
     local_lr_gru = float(getattr(config, "local_lr_gru", config.local_lr))
     local_lr_arch = float(getattr(config, "local_lr_arch", config.local_lr))
     local_lr_base = float(getattr(config, "local_lr_base", config.local_lr))
@@ -1491,6 +1611,14 @@ def main():
         raise ValueError("Config.sca_threshold must be nonnegative")
     if sca_tau <= 0:
         raise ValueError("Config.sca_tau must be positive")
+    if dc_outer_iters <= 0:
+        raise ValueError("Config.dc_outer_iters must be positive")
+    if dc_inner_iters <= 0:
+        raise ValueError("Config.dc_inner_iters must be positive")
+    if dc_tol < 0:
+        raise ValueError("Config.dc_tol must be nonnegative")
+    if dc_inner_tol <= 0:
+        raise ValueError("Config.dc_inner_tol must be positive")
     if local_lr_gru <= 0 or local_lr_arch <= 0 or local_lr_base <= 0:
         raise ValueError("All local learning rates must be positive")
     if local_optimizer_gru not in {"adam", "sgd"} or local_optimizer_arch not in {"adam", "sgd"} or local_optimizer_base not in {"adam", "sgd"}:
@@ -1511,6 +1639,11 @@ def main():
     if beam_ris_optimizer == "sca":
         logger.info(
             f"SCA params: iters={sca_iters}, threshold={sca_threshold:.2e}, tau={sca_tau:.3f}"
+        )
+    elif beam_ris_optimizer == "dc":
+        logger.info(
+            f"DC params: outer_iters={dc_outer_iters}, inner_iters={dc_inner_iters}, "
+            f"tol={dc_tol:.2e}, inner_tol={dc_inner_tol:.2e}"
         )
     logger.info(
         f"Local learning rates: GRU={local_lr_gru:.3e}, "
@@ -1542,6 +1675,13 @@ def main():
         logger.info(f"Delta-motion debug snapshots enabled: {delta_motion_snapshot_run_dir}")
     if gru_pl_snapshot_enabled:
         logger.info(f"GRU PL debug snapshots enabled: {gru_pl_snapshot_run_dir}")
+    if gru_group_switch_sensitivity_snapshot_enabled:
+        logger.info(
+            "GRU group switch sensitivity snapshots enabled: "
+            f"{gru_group_switch_sensitivity_snapshot_run_dir}, "
+            f"tau_B_grid={np.round(gru_group_switch_sensitivity_tau_b_grid, 6).tolist()}, "
+            f"tau_D_grid={np.round(gru_group_switch_sensitivity_tau_d_grid, 6).tolist()}"
+        )
     logger.info("CNN-arch/CNN-base/LMMSE CSI target mode=t (hold-last for uplink evaluation)")
     if direct_only_mode:
         logger.info(
@@ -1710,6 +1850,13 @@ def main():
     gru_group_d_ema = None
     gru_group_scalar_B_ema = None
     gru_group_scalar_D_ema = None
+    gru_group_switch_sensitivity_patience_grid = np.zeros(
+        (
+            int(gru_group_switch_sensitivity_tau_b_grid.size),
+            int(gru_group_switch_sensitivity_tau_d_grid.size),
+        ),
+        dtype=np.int16,
+    )
     global_model_gru_groups = None
     f_beam_gru_groups = None
     theta_ota_gru_groups = None
@@ -2885,6 +3032,31 @@ def main():
 
         if enable_cnn_baseline:
             logger.info("Aggregating literature CNN baseline updates at server.")
+            if (config.use_aircomp and aircomp_sim is not None
+                    and h_eff_baseline is not None and delta_mat_baseline is not None):
+                # Diagnostic only: CNN-base remains FedAvg below, so this must not alter model updates or RNG state.
+                with torch.random.fork_rng(devices=[]):
+                    agg_update_baseline_diag, diag_baseline = aircomp_sim.aggregate_updates(
+                        updates=delta_mat_baseline.float(),
+                        h_eff=h_eff_baseline,
+                        user_weights=K_norm,
+                    )
+                ideal_update_baseline = (
+                    (delta_mat_baseline * K_norm.view(-1, 1)).sum(dim=0) / (K_norm.sum() + 1e-12)
+                )
+                agg_error_power_baseline = torch.norm(agg_update_baseline_diag - ideal_update_baseline) ** 2
+                ideal_power_baseline = torch.norm(ideal_update_baseline) ** 2
+                nmse_baseline = agg_error_power_baseline / (ideal_power_baseline + 1e-12)
+                logger.info(
+                    _colorize_branch_line(
+                        "CNN-base",
+                        f"CNN-base AirComp diagnostic eta={diag_baseline['eta']:.4e}, "
+                        f"min|u|^2={diag_baseline['min_inner2']:.4e}, "
+                        f"agg_NMSE={_highlight_metric_value(nmse_baseline.item(), 'CNN-base')}, "
+                        f"agg_err={agg_error_power_baseline.item():.4e}, "
+                        f"ideal_power={ideal_power_baseline.item():.4e}",
+                    )
+                )
             # Literature baseline uses full-model weighted FedAvg based on per-user data amount.
             global_model_baseline = aggregator_baseline.aggregate(
                 global_model_baseline,
@@ -3163,6 +3335,10 @@ def main():
                 sca_iters=sca_iters,
                 sca_threshold=sca_threshold,
                 sca_tau=sca_tau,
+                dc_outer_iters=dc_outer_iters,
+                dc_inner_iters=dc_inner_iters,
+                dc_tol=dc_tol,
+                dc_inner_tol=dc_inner_tol,
             )
             optimize_elapsed = time.perf_counter() - optimize_start
             logger.info(
@@ -3191,6 +3367,10 @@ def main():
                     sca_iters=sca_iters,
                     sca_threshold=sca_threshold,
                     sca_tau=sca_tau,
+                    dc_outer_iters=dc_outer_iters,
+                    dc_inner_iters=dc_inner_iters,
+                    dc_tol=dc_tol,
+                    dc_inner_tol=dc_inner_tol,
                 )
                 optimize_elapsed_group = time.perf_counter() - optimize_start_group
                 group_nmse_proxies.append(float(nmse_proxy_group))
@@ -3252,6 +3432,10 @@ def main():
                 sca_iters=sca_iters,
                 sca_threshold=sca_threshold,
                 sca_tau=sca_tau,
+                dc_outer_iters=dc_outer_iters,
+                dc_inner_iters=dc_inner_iters,
+                dc_tol=dc_tol,
+                dc_inner_tol=dc_inner_tol,
             )
             optimize_elapsed_arch = time.perf_counter() - optimize_start_arch
             logger.info(
@@ -3290,6 +3474,10 @@ def main():
                 sca_iters=sca_iters,
                 sca_threshold=sca_threshold,
                 sca_tau=sca_tau,
+                dc_outer_iters=dc_outer_iters,
+                dc_inner_iters=dc_inner_iters,
+                dc_tol=dc_tol,
+                dc_inner_tol=dc_inner_tol,
             )
             optimize_elapsed_baseline = time.perf_counter() - optimize_start_baseline
             logger.info(
@@ -3333,6 +3521,10 @@ def main():
                 sca_iters=sca_iters,
                 sca_threshold=sca_threshold,
                 sca_tau=sca_tau,
+                dc_outer_iters=dc_outer_iters,
+                dc_inner_iters=dc_inner_iters,
+                dc_tol=dc_tol,
+                dc_inner_tol=dc_inner_tol,
             )
             optimize_elapsed_lmmse = time.perf_counter() - optimize_start_lmmse
             logger.info(
@@ -3376,6 +3568,10 @@ def main():
             sca_iters=sca_iters,
             sca_threshold=sca_threshold,
             sca_tau=sca_tau,
+            dc_outer_iters=dc_outer_iters,
+            dc_inner_iters=dc_inner_iters,
+            dc_tol=dc_tol,
+            dc_inner_tol=dc_inner_tol,
         )
         optimize_elapsed_oracle = time.perf_counter() - optimize_start_oracle
         logger.info(
@@ -3397,6 +3593,40 @@ def main():
                     f"Oracle-true proxy_NMSE={_highlight_metric_value(nmse_proxy_oracle, 'Oracle-true')}",
                 )
             )
+
+        # Plot-only normalization: keep logged proxy values branch-specific, but draw the
+        # proxy figure with one common reference update variance for cross-baseline fairness.
+        if gru_group_mode == "single":
+            common_proxy_update_vars = delta_var.detach().cpu().numpy()
+            common_proxy_user_weights = K_norm.detach().cpu().numpy()
+            common_proxy_plot_values = {}
+
+            def _record_common_proxy_plot_value(model_name, h_ru_branch, f_branch, theta_branch):
+                proxy_value = _proxy_nmse_for_plot_common_update(
+                    H_BR=H_BR,
+                    h_RUs=h_ru_branch,
+                    h_BUs=h_BUs_opt,
+                    f_vec=f_branch,
+                    theta_vec=theta_branch,
+                    link_switch=link_switch,
+                    user_weights=common_proxy_user_weights,
+                    update_vars=common_proxy_update_vars,
+                    tx_power=config.ota_tx_power,
+                    noise_std=config.ota_noise_std,
+                    eps=config.ota_eps,
+                )
+                if proxy_value is not None:
+                    common_proxy_plot_values[model_name] = proxy_value
+
+            _record_common_proxy_plot_value("GRU", h_RUs_est, f_beam, theta_ota)
+            if enable_cnn_arch_ablation and h_RUs_est_arch is not None:
+                _record_common_proxy_plot_value("CNN-arch", h_RUs_est_arch, f_beam_arch, theta_ota_arch)
+            if enable_cnn_baseline and h_RUs_est_baseline is not None:
+                _record_common_proxy_plot_value("CNN-base", h_RUs_est_baseline, f_beam_baseline, theta_ota_baseline)
+            if enable_lmmse_baseline and h_RUs_est_lmmse is not None:
+                _record_common_proxy_plot_value("LMMSE", h_RUs_est_lmmse, f_beam_lmmse, theta_ota_lmmse)
+            _record_common_proxy_plot_value("Oracle-true", h_RUs_true_for_oracle, f_beam_oracle, theta_ota_oracle)
+            _append_proxy_plot_common_update_csv(logger.stem, round_idx, common_proxy_plot_values)
 
         if enable_gru_semantic_grouping:
             beta_hat_round, d_hat_round, B_round, D_round = _build_gru_grouping_proxies(
@@ -3456,6 +3686,74 @@ def main():
                 f"delta=({delta_B_ema:.4e},{delta_D_ema:.4e}), "
                 f"patience={gru_group_patience_counter}, mode={gru_group_mode}"
             )
+
+            if (
+                gru_group_switch_sensitivity_snapshot_enabled
+                and gru_group_mode == "single"
+                and round_idx < gru_group_switch_min_round
+            ):
+                plateau_grid = (
+                    (delta_B_ema <= gru_group_switch_sensitivity_tau_b_grid[:, None])
+                    & (delta_D_ema <= gru_group_switch_sensitivity_tau_d_grid[None, :])
+                )
+                plateau_grid &= bool(np.isfinite(delta_B_ema) and np.isfinite(delta_D_ema))
+                gru_group_switch_sensitivity_patience_grid = np.where(
+                    plateau_grid,
+                    gru_group_switch_sensitivity_patience_grid + 1,
+                    0,
+                ).astype(np.int16, copy=False)
+                ready_grid = gru_group_switch_sensitivity_patience_grid >= int(gru_group_switch_patience)
+                if round_idx % gru_group_switch_sensitivity_snapshot_every == 0:
+                    snapshot_payload = {
+                        "round_idx": np.asarray(round_idx, dtype=np.int32),
+                        "B": np.asarray(float(B_round), dtype=np.float32),
+                        "D": np.asarray(float(D_round), dtype=np.float32),
+                        "B_ema": np.asarray(float(gru_group_scalar_B_ema), dtype=np.float32),
+                        "D_ema": np.asarray(float(gru_group_scalar_D_ema), dtype=np.float32),
+                        "prev_B_ema": np.asarray(
+                            np.nan if prev_B_ema is None else float(prev_B_ema),
+                            dtype=np.float32,
+                        ),
+                        "prev_D_ema": np.asarray(
+                            np.nan if prev_D_ema is None else float(prev_D_ema),
+                            dtype=np.float32,
+                        ),
+                        "delta_B_ema": np.asarray(float(delta_B_ema), dtype=np.float32),
+                        "delta_D_ema": np.asarray(float(delta_D_ema), dtype=np.float32),
+                        "configured_tau_B": np.asarray(float(gru_group_switch_tau_b), dtype=np.float32),
+                        "configured_tau_D": np.asarray(float(gru_group_switch_tau_d), dtype=np.float32),
+                        "configured_plateau_reached": np.asarray(bool(plateau_reached), dtype=np.int8),
+                        "configured_patience": np.asarray(int(gru_group_patience_counter), dtype=np.int16),
+                        "switch_min_round": np.asarray(int(gru_group_switch_min_round), dtype=np.int32),
+                        "switch_patience": np.asarray(int(gru_group_switch_patience), dtype=np.int16),
+                        "rounds_until_min_round": np.asarray(
+                            int(gru_group_switch_min_round - round_idx),
+                            dtype=np.int32,
+                        ),
+                        "tau_B_grid": np.asarray(gru_group_switch_sensitivity_tau_b_grid, dtype=np.float32),
+                        "tau_D_grid": np.asarray(gru_group_switch_sensitivity_tau_d_grid, dtype=np.float32),
+                        "plateau_grid": np.asarray(plateau_grid, dtype=np.int8),
+                        "patience_grid": np.asarray(gru_group_switch_sensitivity_patience_grid, dtype=np.int16),
+                        "ready_grid": np.asarray(ready_grid, dtype=np.int8),
+                    }
+                    snapshot_meta = {
+                        "num_users": np.asarray(config.num_users, dtype=np.int32),
+                        "log_stem": np.asarray(logger.stem or config.log_prefix()),
+                        "switch_min_round": np.asarray(int(gru_group_switch_min_round), dtype=np.int32),
+                        "switch_patience": np.asarray(int(gru_group_switch_patience), dtype=np.int16),
+                        "ema_lambda": np.asarray(float(gru_group_switch_ema_lambda), dtype=np.float32),
+                        "eps": np.asarray(float(gru_group_eps), dtype=np.float32),
+                        "configured_tau_B": np.asarray(float(gru_group_switch_tau_b), dtype=np.float32),
+                        "configured_tau_D": np.asarray(float(gru_group_switch_tau_d), dtype=np.float32),
+                        "tau_B_grid": np.asarray(gru_group_switch_sensitivity_tau_b_grid, dtype=np.float32),
+                        "tau_D_grid": np.asarray(gru_group_switch_sensitivity_tau_d_grid, dtype=np.float32),
+                    }
+                    save_snapshot_npz(
+                        run_dir=gru_group_switch_sensitivity_snapshot_run_dir,
+                        round_idx=round_idx,
+                        payload=snapshot_payload,
+                        meta=snapshot_meta,
+                    )
 
             if gru_group_mode == "single":
                 if (

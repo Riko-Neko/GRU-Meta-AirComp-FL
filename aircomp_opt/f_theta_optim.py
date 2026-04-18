@@ -88,6 +88,222 @@ def _solve_sca_mu(a_mat, b_mat, c_vec, k2_eff, mu_init, eps):
     return mu_vec
 
 
+def _principal_eigenvector(mat):
+    eigvals, eigvecs = np.linalg.eigh(np.asarray(mat, dtype=np.complex128))
+    return np.asarray(eigvecs[:, np.argmax(eigvals)], dtype=np.complex128).reshape(-1)
+
+
+def _apply_weighted_user_scaling(h_direct, g_maps, k2_eff, eps):
+    h_direct_scaled = np.array(h_direct, dtype=np.complex128, copy=True)
+    g_maps_scaled = np.array(g_maps, dtype=np.complex128, copy=True)
+    scale = np.sqrt(np.maximum(np.asarray(k2_eff, dtype=np.float64).reshape(-1), float(eps)))
+    for user_idx in range(scale.size):
+        h_direct_scaled[:, user_idx] /= scale[user_idx]
+        g_maps_scaled[:, :, user_idx] /= scale[user_idx]
+    return h_direct_scaled, g_maps_scaled
+
+
+def _dc_optimize_f(h_stack, maxiter, epsilon, rho=5.0):
+    try:
+        import cvxpy as cp
+    except Exception as exc:
+        raise RuntimeError(
+            "cvxpy is required for beam_ris_optimizer='dc'. Install cvxpy in the project environment."
+        ) from exc
+
+    h_arr = np.asarray(h_stack, dtype=np.complex128)
+    n_rx, k_users = h_arr.shape
+    H = np.zeros((n_rx, n_rx, k_users), dtype=np.complex128)
+    for user_idx in range(k_users):
+        H[:, :, user_idx] = np.outer(h_arr[:, user_idx], h_arr[:, user_idx].conj())
+
+    seed = np.random.randn(n_rx, 1) + 1j * np.random.randn(n_rx, 1)
+    M = np.outer(seed, seed.conj()).astype(np.complex128)
+    u = _principal_eigenvector(M)
+
+    obj_prev = None
+    for _ in range(int(max(1, maxiter))):
+        M_var = cp.Variable((n_rx, n_rx), hermitian=True)
+        M_partial = np.outer(u, u.conj())
+        penalty_mat = np.eye(n_rx, dtype=np.complex128) - M_partial
+        penalty_mat = 0.5 * (penalty_mat + penalty_mat.conj().T)
+        constraints = [M_var >> 0]
+        constraints += [cp.real(cp.trace(H[:, :, user_idx] @ M_var)) >= 1.0 for user_idx in range(k_users)]
+        cost = cp.real(cp.trace(M_var)) + float(rho) * cp.real(cp.trace(penalty_mat @ M_var))
+        prob = cp.Problem(cp.Minimize(cost), constraints)
+        prob.solve(solver=cp.SCS, verbose=False, max_iters=1000, eps=1e-6, warm_start=True)
+        if prob.status in {"infeasible", "unbounded"} or prob.value is None or M_var.value is None:
+            break
+        M = np.asarray(M_var.value, dtype=np.complex128)
+        u = _principal_eigenvector(M)
+        if obj_prev is not None and abs(float(prob.value) - float(obj_prev)) < float(epsilon):
+            break
+        obj_prev = float(prob.value)
+
+    return _normalize_vector(_principal_eigenvector(M)).astype(np.complex128)
+
+
+def _dc_optimize_theta(h_direct, g_maps, f_vec, theta_init, maxiter, epsilon, eps):
+    try:
+        import cvxpy as cp
+    except Exception as exc:
+        raise RuntimeError(
+            "cvxpy is required for beam_ris_optimizer='dc'. Install cvxpy in the project environment."
+        ) from exc
+
+    h_direct_arr = np.asarray(h_direct, dtype=np.complex128)
+    g_maps_arr = np.asarray(g_maps, dtype=np.complex128)
+    f_arr = np.asarray(f_vec, dtype=np.complex128).reshape(-1)
+    n_ris = g_maps_arr.shape[1]
+    k_users = g_maps_arr.shape[2]
+
+    if n_ris == 0:
+        return np.zeros((0,), dtype=np.complex128), False
+
+    A = np.zeros((n_ris, k_users), dtype=np.complex128)
+    c = np.zeros((k_users,), dtype=np.complex128)
+    R = np.zeros((n_ris + 1, n_ris + 1, k_users), dtype=np.complex128)
+    for user_idx in range(k_users):
+        c[user_idx] = np.conjugate(f_arr) @ h_direct_arr[:, user_idx]
+        A[:, user_idx] = np.conjugate(f_arr) @ g_maps_arr[:, :, user_idx]
+        R[:n_ris, :n_ris, user_idx] = np.outer(A[:, user_idx], A[:, user_idx].conj())
+        R[:n_ris, n_ris, user_idx] = A[:, user_idx] * c[user_idx]
+        R[n_ris, :n_ris, user_idx] = R[:n_ris, n_ris, user_idx].conj()
+
+    if theta_init is None:
+        theta_vec = np.ones((n_ris,), dtype=np.complex128)
+    else:
+        theta_arr = np.asarray(theta_init, dtype=np.complex128).reshape(-1)
+        theta_vec = np.exp(1j * np.angle(theta_arr))
+    v_init = np.concatenate([theta_vec, np.ones((1,), dtype=np.complex128)], axis=0)
+    V = np.outer(v_init, v_init.conj()).astype(np.complex128)
+    u = _principal_eigenvector(V)
+
+    obj_prev = None
+    infeasible = False
+    for _ in range(int(max(1, maxiter))):
+        V_var = cp.Variable((n_ris + 1, n_ris + 1), hermitian=True)
+        V_partial = np.outer(u, u.conj())
+        penalty_mat = np.eye(n_ris + 1, dtype=np.complex128) - V_partial
+        penalty_mat = 0.5 * (penalty_mat + penalty_mat.conj().T)
+        constraints = [V_var >> 0]
+        constraints += [V_var[idx, idx] == 1.0 for idx in range(n_ris + 1)]
+        constraints += [
+            cp.real(cp.trace(R[:, :, user_idx] @ V_var)) + (np.abs(c[user_idx]) ** 2) >= 1.0
+            for user_idx in range(k_users)
+        ]
+        cost = cp.real(cp.trace(penalty_mat @ V_var))
+        prob = cp.Problem(cp.Minimize(cost), constraints)
+        prob.solve(solver=cp.SCS, verbose=False, max_iters=500, eps=1e-6, warm_start=True)
+        if prob.status in {"infeasible", "unbounded"} or prob.value is None or V_var.value is None:
+            infeasible = True
+            break
+        V = np.asarray(V_var.value, dtype=np.complex128)
+        u = _principal_eigenvector(V)
+        if obj_prev is not None and abs(float(prob.value) - float(obj_prev)) < float(epsilon):
+            break
+        obj_prev = float(prob.value)
+
+    if infeasible:
+        return theta_vec.astype(np.complex128), True
+
+    v_tilde = _principal_eigenvector(V)
+    denom = v_tilde[n_ris]
+    if np.abs(denom) <= float(eps):
+        return theta_vec.astype(np.complex128), False
+    theta_out = v_tilde[:n_ris] / denom
+    mag = np.abs(theta_out)
+    valid = mag > float(eps)
+    theta_safe = np.ones_like(theta_out, dtype=np.complex128)
+    theta_safe[valid] = theta_out[valid] / mag[valid]
+    return theta_safe.astype(np.complex128), False
+
+
+def optimize_beam_ris_dc(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, link_switch=(1, 0), user_weights=None,
+                         update_vars=None, tx_power=0.1, noise_std=0.1, var_floor=1e-3, eps=1e-6,
+                         dc_outer_iters=50, dc_inner_iters=50, dc_tol=1e-3, dc_inner_tol=1e-8):
+    """
+    Weighted DC backend migrated from the reference DC_RIS implementation.
+    It aligns with the current OTA objective by pre-scaling each user's affine channel
+    with 1 / sqrt(K_k^2 * var_k), so the DC subproblems optimize the weighted weakest-user gain.
+    """
+    k_users, n_ris = h_RUs.shape
+    m_bs = H_BR.shape[1]
+    reflect_on, direct_on = int(link_switch[0]), int(link_switch[1])
+
+    if user_weights is None:
+        user_weights = np.ones(k_users, dtype=np.float32)
+    user_weights = np.asarray(user_weights, dtype=np.float64).reshape(-1)
+
+    if update_vars is None:
+        update_vars = np.ones(k_users, dtype=np.float32)
+    update_vars = np.maximum(np.asarray(update_vars, dtype=np.float64).reshape(-1), float(var_floor))
+    k2_eff = np.maximum(np.square(user_weights) * update_vars, float(eps))
+
+    h_direct, g_maps = _build_affine_channel_maps(H_BR, h_RUs, h_BUs, reflect_on, direct_on)
+    h_direct_scaled, g_maps_scaled = _apply_weighted_user_scaling(h_direct, g_maps, k2_eff, eps)
+
+    if reflect_on:
+        if theta_init is None:
+            theta_vec = np.ones((n_ris,), dtype=np.complex128)
+        else:
+            theta_arr = np.asarray(theta_init, dtype=np.complex128).reshape(-1)
+            theta_vec = np.exp(1j * np.angle(theta_arr))
+    else:
+        theta_vec = np.zeros((n_ris,), dtype=np.complex128)
+
+    h_stack = np.zeros((m_bs, k_users), dtype=np.complex128)
+    for user_idx in range(k_users):
+        h_stack[:, user_idx] = h_direct_scaled[:, user_idx] + g_maps_scaled[:, :, user_idx] @ theta_vec
+
+    if f_init is None:
+        f_seed = h_stack[:, 0] if k_users > 0 else np.ones((m_bs,), dtype=np.complex128)
+    else:
+        f_seed = np.asarray(f_init, dtype=np.complex128).reshape(-1)
+    f_vec = _normalize_vector(f_seed).astype(np.complex128)
+
+    obj_prev = float(np.min(np.abs(np.conjugate(f_vec) @ h_stack) ** 2)) if k_users > 0 else 0.0
+    for _ in range(int(max(1, dc_outer_iters))):
+        f_vec = _dc_optimize_f(h_stack, maxiter=dc_inner_iters, epsilon=dc_inner_tol)
+        if reflect_on:
+            theta_candidate, infeasible = _dc_optimize_theta(
+                h_direct_scaled,
+                g_maps_scaled,
+                f_vec,
+                theta_vec,
+                maxiter=dc_inner_iters,
+                epsilon=dc_inner_tol,
+                eps=eps,
+            )
+            if not infeasible:
+                theta_vec = theta_candidate
+        for user_idx in range(k_users):
+            h_stack[:, user_idx] = h_direct_scaled[:, user_idx] + g_maps_scaled[:, :, user_idx] @ theta_vec
+        obj_new = float(np.min(np.abs(np.conjugate(f_vec) @ h_stack) ** 2)) if k_users > 0 else 0.0
+        if abs(obj_new - obj_prev) < float(dc_tol):
+            break
+        obj_prev = obj_new
+
+    _, h_eff, _ = _compute_effective_channels(
+        H_BR,
+        h_RUs,
+        f_vec.astype(np.complex64),
+        theta_vec.astype(np.complex64),
+        h_BUs,
+        reflect_on,
+        direct_on,
+    )
+    _, _, nmse_proxy = _compute_eta_proxy(
+        h_eff=h_eff,
+        user_weights=user_weights,
+        update_vars=update_vars,
+        tx_power=tx_power,
+        noise_std=noise_std,
+        eps=eps,
+    )
+    return f_vec.astype(np.complex64), theta_vec.astype(np.complex64), nmse_proxy
+
+
 def optimize_beam_ris(H_BR, h_RUs, h_BUs=None, theta_init=None, f_init=None, link_switch=(1, 0), user_weights=None,
                       update_vars=None, tx_power=0.1, noise_std=0.1, var_floor=1e-3, eps=1e-8, oa_iters=5):
     """
@@ -271,8 +487,22 @@ def optimize_beam_ris_by_mode(mode="oa", **kwargs):
         kwargs.pop("sca_iters", None)
         kwargs.pop("sca_threshold", None)
         kwargs.pop("sca_tau", None)
+        kwargs.pop("dc_outer_iters", None)
+        kwargs.pop("dc_inner_iters", None)
+        kwargs.pop("dc_tol", None)
+        kwargs.pop("dc_inner_tol", None)
         return optimize_beam_ris(**kwargs)
     if optimizer_mode == "sca":
         kwargs.pop("oa_iters", None)
+        kwargs.pop("dc_outer_iters", None)
+        kwargs.pop("dc_inner_iters", None)
+        kwargs.pop("dc_tol", None)
+        kwargs.pop("dc_inner_tol", None)
         return optimize_beam_ris_sca(**kwargs)
-    raise ValueError("optimizer mode must be 'oa' or 'sca'")
+    if optimizer_mode == "dc":
+        kwargs.pop("oa_iters", None)
+        kwargs.pop("sca_iters", None)
+        kwargs.pop("sca_threshold", None)
+        kwargs.pop("sca_tau", None)
+        return optimize_beam_ris_dc(**kwargs)
+    raise ValueError("optimizer mode must be 'oa', 'sca', or 'dc'")

@@ -2,6 +2,8 @@ import hashlib
 import json
 import math
 
+import numpy as np
+
 
 # Configuration parameters for the simulation
 class Config:
@@ -18,7 +20,7 @@ class Config:
     num_users = 10  # number of users (K)
     num_bs_antennas = 32  # number of BS antennas (M)
     num_ris_elements = 64  # number of RIS elements (N)
-    num_pilots = 4  # number of pilot transmissions per time slot (P)
+    num_pilots = 8  # number of pilot transmissions per time slot (P)
 
     # Mobility-driven synthetic geometry
     bs_position_xy = [0.0, 0.0]
@@ -29,10 +31,12 @@ class Config:
     user_cluster_position_jitter_xy = [[10.0, 10.0], [10.0, 10.0]]
     # user_cluster_centers_xy = [[50.0, 0.0]]
     # user_cluster_position_jitter_xy = [[10.0, 10.0]]
-    user_speed_range = [1, 5]  # m/s; sampled per-user, then combined with a random direction
+    user_speed_range = [0.5, 1.5]  # m/s; sampled per-user, then combined with a random direction
+    # user_speed_range = [5, 10]
     user_motion_direction_deg = None  # None=random direction per-user; float=fixed direction for all users
-    # user_speed_user_mask = []  # 1 means all users move; list of 1-based user ids moves only those users
-    user_speed_user_mask = [7, 8, 9, 10]
+    user_speed_user_mask = []  # 1 means all users move; list of 1-based user ids moves only those users
+    # user_speed_user_mask = [2, 4, 6, 8, 10]
+    # user_speed_user_mask = [7, 9]
     channel_time_step = 1e-3  # seconds between consecutive channel samples
     channel_carrier_frequency_hz = 3.5e9
     channel_min_distance = 1.0
@@ -41,7 +45,7 @@ class Config:
 
     # Link switch: [reflection, direct]
     # [1,0] reflection only (default), [0,1] direct only (no RIS), [1,1] both, [0,0] invalid
-    link_switch = [1, 1]
+    link_switch = [1, 0]
 
     # Pilot observation noise
     pilot_SNR_dB = 20
@@ -96,14 +100,14 @@ class Config:
     enable_gru_pl_factorization = True
     gru_pl_loss_weight = 0.05
     gru_pl_eps = 1e-12
-    enable_gru_semantic_grouping = True
+    enable_gru_semantic_grouping = False
     gru_group_switch_min_round = 10
-    gru_group_switch_patience = 3
-    gru_group_switch_ema_lambda = 0.8
-    gru_group_switch_tau_b = 0.08
-    gru_group_switch_tau_d = 0.08
+    gru_group_switch_patience = 2
+    gru_group_switch_ema_lambda = 0.5
+    gru_group_switch_tau_b = 0.075
+    gru_group_switch_tau_d = 0.075
     gru_group_eps = 1e-8
-    gru_group_freeze_after_switch = True
+    gru_group_freeze_after_switch = False
     gru_groupwise_standardization = True
     gru_restart_training_after_switch = False
     gru_head_reset_to_group_mean_on_switch = False
@@ -113,13 +117,13 @@ class Config:
     gru_reset_hidden_on_group_switch = False
     gru_reset_hidden_on_group_change_each_round = False
     gru_disable_persistent_hidden_after_switch = False
-    gru_group_lambda_d = 8.0
+    gru_group_lambda_d = 7.5
     gru_group_c_beta = 0.5
     gru_group_c_d = 0.5
-    gru_group_lambda_s = 0.0
-    gru_group_gamma = 0.0
-    gru_group_lambda_h = 0.0
-    gru_group_tau = 0.0
+    gru_group_lambda_s = 0.025
+    gru_group_gamma = 0.1
+    gru_group_lambda_h = 0.025
+    gru_group_tau = 0.025
     gru_group_k_min = 2
     gru_group_sca_max_iters = 8
     gru_group_sca_tol = 1e-4
@@ -138,10 +142,14 @@ class Config:
     ota_use_estimated_h_ru_for_aggregation = True  # if True, OTA h_eff uses branch-specific estimated h_RU; direct h_BU remains true
     ota_use_weighted_users = True  # if False, always use equal weights (all ones)
     oa_iters = 20
-    beam_ris_optimizer = "sca"  # "oa" | "sca"
+    beam_ris_optimizer = "sca"  # "oa" | "sca" | "dc"
     sca_iters = 20
     sca_threshold = 1e-2
     sca_tau = 1.0
+    dc_outer_iters = 3
+    dc_inner_iters = 5
+    dc_tol = 1e-3
+    dc_inner_tol = 1e-4
     # Optional user-data partition profile (equal/grouped) for experiment bookkeeping.
     # Runtime n_k used by OTA aggregation is computed from actual per-user local sample counts.
     user_data_partition_mode = "equal"  # "equal" | "grouped"
@@ -173,6 +181,11 @@ class Config:
     enable_gru_pl_debug_snapshot = False
     gru_pl_debug_snapshot_root = "debug/gru_pl_snapshots"
     gru_pl_debug_snapshot_every = 1
+    enable_gru_group_switch_sensitivity_snapshot = False
+    gru_group_switch_sensitivity_snapshot_root = "debug/gru_group_switch_sensitivity_snapshots"
+    gru_group_switch_sensitivity_snapshot_every = 1
+    gru_group_switch_sensitivity_tau_b_values = np.linspace(0.002, 0.006, 100)
+    gru_group_switch_sensitivity_tau_d_values = np.linspace(0.02, 0.06, 100)
 
     @staticmethod
     def _slug_value(value) -> str:
@@ -196,6 +209,10 @@ class Config:
             "sca_iters",
             "sca_threshold",
             "sca_tau",
+            "dc_outer_iters",
+            "dc_inner_iters",
+            "dc_tol",
+            "dc_inner_tol",
             "enable_cnn_baseline",
             "cnn_baseline_conv_filters",
             "cnn_baseline_conv_kernel",
@@ -228,6 +245,11 @@ class Config:
             "enable_gru_pl_debug_snapshot",
             "gru_pl_debug_snapshot_root",
             "gru_pl_debug_snapshot_every",
+            "enable_gru_group_switch_sensitivity_snapshot",
+            "gru_group_switch_sensitivity_snapshot_root",
+            "gru_group_switch_sensitivity_snapshot_every",
+            "gru_group_switch_sensitivity_tau_b_values",
+            "gru_group_switch_sensitivity_tau_d_values",
         }
 
     @classmethod
@@ -272,6 +294,13 @@ class Config:
         mode = str(cls.beam_ris_optimizer).lower()
         if mode == "sca":
             return f"S{int(cls.sca_iters)}T{cls._slug_value(cls.sca_threshold)}U{cls._slug_value(cls.sca_tau)}"
+        if mode == "dc":
+            return (
+                f"D{int(cls.dc_outer_iters)}"
+                f"J{int(cls.dc_inner_iters)}"
+                f"T{cls._slug_value(cls.dc_tol)}"
+                f"E{cls._slug_value(cls.dc_inner_tol)}"
+            )
         return f"O{int(cls.oa_iters)}"
 
     @staticmethod

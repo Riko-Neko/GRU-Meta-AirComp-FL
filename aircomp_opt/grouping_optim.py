@@ -27,7 +27,7 @@ class GroupingSCAConfig:
                 + lambda_h sum_k |x_k-x_k_prev|
                 + tau sum_k x_k (1-x_k)
 
-    solved via SCA with a linear-program subproblem per outer iteration.
+    solved via SCA with a convex surrogate subproblem per outer iteration.
     """
 
     lambda_d: float = 1.0
@@ -44,6 +44,8 @@ class GroupingSCAConfig:
     sca_max_iters: int = 30
     sca_tol: float = 1e-4
     relaxation: float = 1.0
+    subproblem_method: str = "SLSQP"
+    subproblem_maxiter: int = 200
     lp_method: str = "highs"
 
     def validate(self, num_users: int) -> None:
@@ -65,6 +67,8 @@ class GroupingSCAConfig:
             raise ValueError("sca_tol must be positive")
         if not (0.0 < float(self.relaxation) <= 1.0):
             raise ValueError("relaxation must lie in (0, 1]")
+        if int(self.subproblem_maxiter) <= 0:
+            raise ValueError("subproblem_maxiter must be positive")
 
 
 @dataclass
@@ -90,8 +94,8 @@ class GroupingResult:
     objective_history: np.ndarray
     converged: bool
     iterations: int
-    lp_status: str
-    lp_success: bool
+    subproblem_status: str
+    subproblem_success: bool
     group_low: np.ndarray
     group_high: np.ndarray
 
@@ -106,13 +110,14 @@ class SweepScoreWeights:
 
 
 @dataclass
-class _LPVarIndex:
+class _SubproblemVarIndex:
     x: slice
     mu1: int
     mu2: int
     q1: slice
     q2: slice
-    u: slice
+    y1: slice
+    y2: slice
     s: slice
     num_vars: int
 
@@ -129,7 +134,7 @@ def _pair_indices(num_users: int) -> List[Tuple[int, int]]:
     return [(i, j) for i in range(num_users) for j in range(i + 1, num_users)]
 
 
-def _build_lp_index(num_users: int, pairs: Sequence[Tuple[int, int]]) -> _LPVarIndex:
+def _build_subproblem_index(num_users: int) -> _SubproblemVarIndex:
     start = 0
     x = slice(start, start + num_users)
     start = x.stop
@@ -140,11 +145,13 @@ def _build_lp_index(num_users: int, pairs: Sequence[Tuple[int, int]]) -> _LPVarI
     start = q1.stop
     q2 = slice(start, start + num_users)
     start = q2.stop
-    u = slice(start, start + len(pairs))
-    start = u.stop
+    y1 = slice(start, start + num_users)
+    start = y1.stop
+    y2 = slice(start, start + num_users)
+    start = y2.stop
     s = slice(start, start + num_users)
     start = s.stop
-    return _LPVarIndex(x=x, mu1=mu1, mu2=mu2, q1=q1, q2=q2, u=u, s=s, num_vars=start)
+    return _SubproblemVarIndex(x=x, mu1=mu1, mu2=mu2, q1=q1, q2=q2, y1=y1, y2=y2, s=s, num_vars=start)
 
 
 def build_proxy_features(
@@ -365,8 +372,9 @@ def _repair_hard_grouping(x_soft: np.ndarray, k_min: int) -> np.ndarray:
     return hard.astype(np.int64)
 
 
-def _solve_linearized_subproblem(
+def _solve_convex_surrogate_subproblem(
         x_curr: np.ndarray,
+        mu_curr: np.ndarray,
         q1_curr: np.ndarray,
         q2_curr: np.ndarray,
         nominal_risk: np.ndarray,
@@ -374,145 +382,259 @@ def _solve_linearized_subproblem(
         compatibility: np.ndarray,
         x_prev: np.ndarray,
         cfg: GroupingSCAConfig,
-) -> Tuple[np.ndarray, np.ndarray, str, bool]:
+) -> Tuple[np.ndarray, str, bool]:
     try:
-        from scipy.optimize import linprog
+        from scipy.optimize import minimize
     except ImportError as exc:
         raise ImportError(
             "SciPy is required for the SCA grouping optimizer. Install scipy in the project environment."
         ) from exc
 
     num_users = int(np.asarray(nominal_risk).size)
-    pairs = _pair_indices(num_users)
-    index = _build_lp_index(num_users, pairs)
+    index = _build_subproblem_index(num_users)
 
     x_curr = np.asarray(x_curr, dtype=np.float64).reshape(-1)
+    mu_curr = np.asarray(mu_curr, dtype=np.float64).reshape(2)
     q1_curr = np.asarray(q1_curr, dtype=np.float64).reshape(-1)
     q2_curr = np.asarray(q2_curr, dtype=np.float64).reshape(-1)
     risk_arr = np.asarray(nominal_risk, dtype=np.float64).reshape(-1)
     radius_arr = np.asarray(risk_radius, dtype=np.float64).reshape(-1)
     prev_arr = np.asarray(x_prev, dtype=np.float64).reshape(-1)
 
-    c = np.zeros((index.num_vars,), dtype=np.float64)
+    y1_curr = np.square(q1_curr + radius_arr)
+    y2_curr = np.square(q2_curr + radius_arr)
 
-    c[index.mu1] = float(cfg.lambda_s)
-    c[index.mu2] = -float(cfg.lambda_s)
+    compat_coeff = np.zeros((num_users,), dtype=np.float64)
+    for i, j in _pair_indices(num_users):
+        pair_weight = float(cfg.gamma) * (1.0 - float(compatibility[i, j]))
+        d_curr = float(x_curr[i] - x_curr[j])
+        if d_curr > 0.0:
+            grad_abs = 1.0
+        elif d_curr < 0.0:
+            grad_abs = -1.0
+        else:
+            grad_abs = 0.0
+        compat_coeff[i] -= pair_weight * grad_abs
+        compat_coeff[j] += pair_weight * grad_abs
 
-    for k in range(num_users):
-        q1_shift = q1_curr[k] + radius_arr[k]
-        q2_shift = q2_curr[k] + radius_arr[k]
-        c[index.x.start + k] = (
-                -(q1_shift ** 2)
-                + (q2_shift ** 2)
-                + float(cfg.tau) * (1.0 - 2.0 * x_curr[k])
-        )
-        c[index.q1.start + k] = 2.0 * (1.0 - x_curr[k]) * q1_shift
-        c[index.q2.start + k] = 2.0 * x_curr[k] * q2_shift
-        c[index.s.start + k] = float(cfg.lambda_h)
+    linear_matrix = []
+    linear_offset = []
 
-    for pair_offset, (i, j) in enumerate(pairs):
-        c[index.u.start + pair_offset] = -float(cfg.gamma) * (1.0 - float(compatibility[i, j]))
-
-    A_ub: List[np.ndarray] = []
-    b_ub: List[float] = []
-
-    # Group-size constraints.
     row = np.zeros((index.num_vars,), dtype=np.float64)
     row[index.x] = 1.0
-    A_ub.append(row)
-    b_ub.append(float(num_users - cfg.k_min))
+    linear_matrix.append(row)
+    linear_offset.append(-float(cfg.k_min))
 
     row = np.zeros((index.num_vars,), dtype=np.float64)
     row[index.x] = -1.0
-    A_ub.append(row)
-    b_ub.append(float(-cfg.k_min))
+    linear_matrix.append(row)
+    linear_offset.append(float(num_users - cfg.k_min))
 
-    # mu_2 >= mu_1.
     row = np.zeros((index.num_vars,), dtype=np.float64)
-    row[index.mu1] = 1.0
-    row[index.mu2] = -1.0
-    A_ub.append(row)
-    b_ub.append(0.0)
+    row[index.mu2] = 1.0
+    row[index.mu1] = -1.0
+    linear_matrix.append(row)
+    linear_offset.append(0.0)
 
-    # q_{k,g} >= +/- (r_k - mu_g)
     for k in range(num_users):
-        # q1_k >= r_k - mu1  => -q1_k - mu1 <= -r_k
         row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.q1.start + k] = -1.0
-        row[index.mu1] = -1.0
-        A_ub.append(row)
-        b_ub.append(-float(risk_arr[k]))
-
-        # q1_k >= mu1 - r_k => -q1_k + mu1 <= r_k
-        row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.q1.start + k] = -1.0
+        row[index.q1.start + k] = 1.0
         row[index.mu1] = 1.0
-        A_ub.append(row)
-        b_ub.append(float(risk_arr[k]))
+        linear_matrix.append(row)
+        linear_offset.append(-float(risk_arr[k]))
 
-        # q2_k >= r_k - mu2  => -q2_k - mu2 <= -r_k
         row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.q2.start + k] = -1.0
-        row[index.mu2] = -1.0
-        A_ub.append(row)
-        b_ub.append(-float(risk_arr[k]))
+        row[index.q1.start + k] = 1.0
+        row[index.mu1] = -1.0
+        linear_matrix.append(row)
+        linear_offset.append(float(risk_arr[k]))
 
-        # q2_k >= mu2 - r_k => -q2_k + mu2 <= r_k
         row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.q2.start + k] = -1.0
+        row[index.q2.start + k] = 1.0
         row[index.mu2] = 1.0
-        A_ub.append(row)
-        b_ub.append(float(risk_arr[k]))
-
-    # u_ij >= |x_i - x_j|
-    for pair_offset, (i, j) in enumerate(pairs):
-        row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.x.start + i] = 1.0
-        row[index.x.start + j] = -1.0
-        row[index.u.start + pair_offset] = -1.0
-        A_ub.append(row)
-        b_ub.append(0.0)
+        linear_matrix.append(row)
+        linear_offset.append(-float(risk_arr[k]))
 
         row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.x.start + i] = -1.0
-        row[index.x.start + j] = 1.0
-        row[index.u.start + pair_offset] = -1.0
-        A_ub.append(row)
-        b_ub.append(0.0)
-
-    # s_k >= |x_k - x_prev_k|
-    for k in range(num_users):
-        row = np.zeros((index.num_vars,), dtype=np.float64)
-        row[index.x.start + k] = 1.0
-        row[index.s.start + k] = -1.0
-        A_ub.append(row)
-        b_ub.append(float(prev_arr[k]))
+        row[index.q2.start + k] = 1.0
+        row[index.mu2] = -1.0
+        linear_matrix.append(row)
+        linear_offset.append(float(risk_arr[k]))
 
         row = np.zeros((index.num_vars,), dtype=np.float64)
+        row[index.s.start + k] = 1.0
         row[index.x.start + k] = -1.0
-        row[index.s.start + k] = -1.0
-        A_ub.append(row)
-        b_ub.append(float(-prev_arr[k]))
+        linear_matrix.append(row)
+        linear_offset.append(float(prev_arr[k]))
+
+        row = np.zeros((index.num_vars,), dtype=np.float64)
+        row[index.s.start + k] = 1.0
+        row[index.x.start + k] = 1.0
+        linear_matrix.append(row)
+        linear_offset.append(float(-prev_arr[k]))
+
+    A_lin = np.asarray(linear_matrix, dtype=np.float64)
+    b_lin = np.asarray(linear_offset, dtype=np.float64)
 
     bounds: List[Tuple[Optional[float], Optional[float]]] = []
     bounds.extend([(0.0, 1.0) for _ in range(num_users)])
-    bounds.append((None, None))  # mu1
-    bounds.append((None, None))  # mu2
-    bounds.extend([(0.0, None) for _ in range(num_users)])  # q1
-    bounds.extend([(0.0, None) for _ in range(num_users)])  # q2
-    bounds.extend([(0.0, 1.0) for _ in pairs])  # u
-    bounds.extend([(0.0, 1.0) for _ in range(num_users)])  # s
+    bounds.append((None, None))
+    bounds.append((None, None))
+    bounds.extend([(0.0, None) for _ in range(num_users)])
+    bounds.extend([(0.0, None) for _ in range(num_users)])
+    bounds.extend([(0.0, None) for _ in range(num_users)])
+    bounds.extend([(0.0, None) for _ in range(num_users)])
+    bounds.extend([(0.0, None) for _ in range(num_users)])
 
-    result = linprog(
-        c=c,
-        A_ub=np.asarray(A_ub, dtype=np.float64),
-        b_ub=np.asarray(b_ub, dtype=np.float64),
+    z0 = np.zeros((index.num_vars,), dtype=np.float64)
+    z0[index.x] = x_curr
+    z0[index.mu1] = float(mu_curr[0])
+    z0[index.mu2] = float(mu_curr[1])
+    z0[index.q1] = q1_curr
+    z0[index.q2] = q2_curr
+    z0[index.y1] = y1_curr
+    z0[index.y2] = y2_curr
+    z0[index.s] = np.abs(x_curr - prev_arr)
+
+    def objective(z_vec: np.ndarray) -> float:
+        x_vec = z_vec[index.x]
+        y1_vec = z_vec[index.y1]
+        y2_vec = z_vec[index.y2]
+        mu1_val = float(z_vec[index.mu1])
+        mu2_val = float(z_vec[index.mu2])
+        s_vec = z_vec[index.s]
+
+        low_convex = 0.25 * np.square(1.0 - x_vec + y1_vec)
+        low_concave_anchor = 1.0 - x_curr - y1_curr
+        low_tangent = -0.25 * np.square(low_concave_anchor) + 0.5 * low_concave_anchor * (
+                (x_vec - x_curr) + (y1_vec - y1_curr)
+        )
+
+        high_convex = 0.25 * np.square(x_vec + y2_vec)
+        high_concave_anchor = x_curr - y2_curr
+        high_tangent = -0.25 * np.square(high_concave_anchor) + (
+                -0.5 * high_concave_anchor * (x_vec - x_curr)
+                + 0.5 * high_concave_anchor * (y2_vec - y2_curr)
+        )
+
+        compat_linear = np.dot(compat_coeff, x_vec)
+        migrate_linear = float(cfg.lambda_h) * np.sum(s_vec)
+        binary_linear = float(cfg.tau) * np.dot(1.0 - 2.0 * x_curr, x_vec)
+        separation_linear = float(cfg.lambda_s) * (mu1_val - mu2_val)
+
+        return float(
+            np.sum(low_convex + low_tangent + high_convex + high_tangent)
+            + compat_linear
+            + migrate_linear
+            + binary_linear
+            + separation_linear
+        )
+
+    def objective_jac(z_vec: np.ndarray) -> np.ndarray:
+        grad = np.zeros_like(z_vec)
+        x_vec = z_vec[index.x]
+        y1_vec = z_vec[index.y1]
+        y2_vec = z_vec[index.y2]
+
+        low_anchor = 1.0 - x_curr - y1_curr
+        a1 = 1.0 - x_vec + y1_vec
+        grad[index.x] += -0.5 * a1 + 0.5 * low_anchor
+        grad[index.y1] += 0.5 * a1 + 0.5 * low_anchor
+
+        high_anchor = x_curr - y2_curr
+        a2 = x_vec + y2_vec
+        grad[index.x] += 0.5 * a2 - 0.5 * high_anchor
+        grad[index.y2] += 0.5 * a2 + 0.5 * high_anchor
+
+        grad[index.x] += compat_coeff + float(cfg.tau) * (1.0 - 2.0 * x_curr)
+        grad[index.s] += float(cfg.lambda_h)
+        grad[index.mu1] += float(cfg.lambda_s)
+        grad[index.mu2] -= float(cfg.lambda_s)
+        return grad
+
+    def linear_constraint_fun(z_vec: np.ndarray) -> np.ndarray:
+        return A_lin @ z_vec + b_lin
+
+    def linear_constraint_jac(_z_vec: np.ndarray) -> np.ndarray:
+        return A_lin
+
+    def nonlinear_constraint_fun(z_vec: np.ndarray) -> np.ndarray:
+        q1_vec = z_vec[index.q1]
+        q2_vec = z_vec[index.q2]
+        y1_vec = z_vec[index.y1]
+        y2_vec = z_vec[index.y2]
+        return np.concatenate([
+            y1_vec - np.square(q1_vec + radius_arr),
+            y2_vec - np.square(q2_vec + radius_arr),
+        ])
+
+    def nonlinear_constraint_jac(z_vec: np.ndarray) -> np.ndarray:
+        q1_vec = z_vec[index.q1]
+        q2_vec = z_vec[index.q2]
+        jac = np.zeros((2 * num_users, index.num_vars), dtype=np.float64)
+        for k in range(num_users):
+            jac[k, index.q1.start + k] = -2.0 * (q1_vec[k] + radius_arr[k])
+            jac[k, index.y1.start + k] = 1.0
+            jac[num_users + k, index.q2.start + k] = -2.0 * (q2_vec[k] + radius_arr[k])
+            jac[num_users + k, index.y2.start + k] = 1.0
+        return jac
+
+    constraints = [
+        {
+            "type": "ineq",
+            "fun": linear_constraint_fun,
+            "jac": linear_constraint_jac,
+        },
+        {
+            "type": "ineq",
+            "fun": nonlinear_constraint_fun,
+            "jac": nonlinear_constraint_jac,
+        },
+    ]
+
+    method = str(cfg.subproblem_method).strip() or "SLSQP"
+    result = minimize(
+        objective,
+        z0,
+        method=method,
+        jac=objective_jac,
         bounds=bounds,
-        method=str(cfg.lp_method),
+        constraints=constraints,
+        options={"maxiter": int(cfg.subproblem_maxiter), "ftol": 1e-9, "disp": False},
     )
+
+    def _max_feasibility_violation(z_vec: np.ndarray) -> float:
+        violations = [0.0]
+        linear_vals = linear_constraint_fun(z_vec)
+        nonlinear_vals = nonlinear_constraint_fun(z_vec)
+        violations.append(float(np.max(np.maximum(-linear_vals, 0.0))))
+        violations.append(float(np.max(np.maximum(-nonlinear_vals, 0.0))))
+        for idx_var, (lower, upper) in enumerate(bounds):
+            if lower is not None:
+                violations.append(max(float(lower) - float(z_vec[idx_var]), 0.0))
+            if upper is not None:
+                violations.append(float(z_vec[idx_var]) - float(upper))
+        return float(max(violations))
+
+    message = str(result.message)
     if result.x is None:
-        raise RuntimeError(f"linprog failed without a primal point: {result.message}")
-    return np.asarray(result.x, dtype=np.float64), c, str(result.message), bool(result.success)
+        return z0.copy(), f"fallback_to_current: no primal point ({message})", False
+
+    candidate = np.asarray(result.x, dtype=np.float64)
+    feasibility_violation = _max_feasibility_violation(candidate)
+    objective_tol = 1e-8 * max(1.0, abs(objective(z0)))
+    feasible_tol = 1e-6
+
+    if bool(result.success) and feasibility_violation <= feasible_tol:
+        return candidate, message, True
+
+    # SLSQP can report a line-search failure even when the returned point is
+    # feasible and improves the convex surrogate. Keep such points instead of
+    # aborting long parameter sweeps.
+    if feasibility_violation <= feasible_tol and objective(candidate) <= objective(z0) + objective_tol:
+        return candidate, f"accepted_solver_warning: {message}", True
+
+    return z0.copy(), f"fallback_to_current: {message}; max_violation={feasibility_violation:.3e}", False
 
 
 def optimize_risk_grouping_sca(
@@ -591,12 +713,13 @@ def optimize_risk_grouping_sca(
     ]
 
     converged = False
-    lp_status = "not_started"
-    lp_success = False
+    subproblem_status = "not_started"
+    subproblem_success = False
 
     for _iter in range(int(cfg.sca_max_iters)):
-        solution, _, lp_status, lp_success = _solve_linearized_subproblem(
+        solution, subproblem_status, subproblem_success = _solve_convex_surrogate_subproblem(
             x_curr=x_curr,
+            mu_curr=mu_curr,
             q1_curr=q1_curr,
             q2_curr=q2_curr,
             nominal_risk=nominal_risk,
@@ -605,11 +728,10 @@ def optimize_risk_grouping_sca(
             x_prev=x_prev,
             cfg=cfg,
         )
-        if not lp_success:
-            raise RuntimeError(f"SCA LP subproblem failed: {lp_status}")
+        if not subproblem_success:
+            break
 
-        pairs = _pair_indices(num_users)
-        index = _build_lp_index(num_users, pairs)
+        index = _build_subproblem_index(num_users)
         x_lp = np.clip(solution[index.x], 0.0, 1.0)
         mu_lp = np.asarray([solution[index.mu1], solution[index.mu2]], dtype=np.float64)
         mu_lp[1] = max(mu_lp[1], mu_lp[0])
@@ -655,8 +777,8 @@ def optimize_risk_grouping_sca(
         objective_history=np.asarray(objective_history, dtype=np.float64),
         converged=bool(converged),
         iterations=len(objective_history) - 1,
-        lp_status=lp_status,
-        lp_success=bool(lp_success),
+        subproblem_status=subproblem_status,
+        subproblem_success=bool(subproblem_success),
         group_low=group_low,
         group_high=group_high,
     )
@@ -901,7 +1023,9 @@ def _print_single_trial(
         "grouping_cfg="
         f"{{lambda_d={grouping_cfg.lambda_d}, lambda_s={grouping_cfg.lambda_s}, gamma={grouping_cfg.gamma}, "
         f"lambda_h={grouping_cfg.lambda_h}, tau={grouping_cfg.tau}, "
-        f"sca_max_iters={grouping_cfg.sca_max_iters}, sca_tol={grouping_cfg.sca_tol}}}"
+        f"sca_max_iters={grouping_cfg.sca_max_iters}, sca_tol={grouping_cfg.sca_tol}, "
+        f"subproblem_method={grouping_cfg.subproblem_method}, "
+        f"subproblem_maxiter={grouping_cfg.subproblem_maxiter}}}"
     )
     print(f"cluster_ids={cluster_ids.tolist()}")
     print(f"speed_mps={_format_vector(smoke_case['speed_mps'], precision=3)}")
@@ -916,7 +1040,10 @@ def _print_single_trial(
     print(f"group_high(user ids)={result.group_high.tolist()}")
     print(f"mu={_format_vector(result.mu, precision=6)}")
     print(f"objective_history={_format_vector(result.objective_history, precision=6)}")
-    print(f"converged={result.converged}, iterations={result.iterations}, lp_status={result.lp_status}")
+    print(
+        f"converged={result.converged}, iterations={result.iterations}, "
+        f"subproblem_status={result.subproblem_status}"
+    )
 
     if unique_clusters.size == 2:
         cluster_risk_means = {}
@@ -1021,8 +1148,8 @@ def _write_sweep_csv(
         "sweep_score",
         "converged",
         "iterations",
-        "lp_success",
-        "lp_status",
+        "subproblem_success",
+        "subproblem_status",
         "group_low",
         "group_high",
     ]
@@ -1065,8 +1192,8 @@ def _write_sweep_csv(
                     "sweep_score": float(metrics["sweep_score"]),
                     "converged": bool(result.converged),
                     "iterations": int(result.iterations),
-                    "lp_success": bool(result.lp_success),
-                    "lp_status": str(result.lp_status),
+                    "subproblem_success": bool(result.subproblem_success),
+                    "subproblem_status": str(result.subproblem_status),
                     "group_low": json.dumps(result.group_low.tolist(), ensure_ascii=True),
                     "group_high": json.dumps(result.group_high.tolist(), ensure_ascii=True),
                 }
@@ -1103,7 +1230,7 @@ def _write_sweep_summary(
         "best_metrics": _to_builtin(best_metrics),
         "best_group_low": _to_builtin(best_result.group_low),
         "best_group_high": _to_builtin(best_result.group_high),
-        "best_lp_status": str(best_result.lp_status),
+        "best_subproblem_status": str(best_result.subproblem_status),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -1121,8 +1248,8 @@ def _write_sweep_summary(
         "objective_history": _to_builtin(best_result.objective_history),
         "converged": bool(best_result.converged),
         "iterations": int(best_result.iterations),
-        "lp_status": str(best_result.lp_status),
-        "lp_success": bool(best_result.lp_success),
+        "subproblem_status": str(best_result.subproblem_status),
+        "subproblem_success": bool(best_result.subproblem_success),
     }
     best_path.write_text(json.dumps(best_trial, indent=2), encoding="utf-8")
 
@@ -1427,7 +1554,7 @@ def _smoke_test_main() -> None:
         user_cluster_position_jitter_xy=[[10.0, 10.0], [10.0, 10.0]],
         user_speed_range=[10.0, 20.0],
         user_motion_direction_deg=None,
-        user_speed_user_mask=[9, 10],
+        user_speed_user_mask=[1, 4, 8, 9, 10],
         alpha_direct=2.0,
         channel_ref_scale=float(np.sqrt(1e-10)),
         channel_time_step=1e-3,
@@ -1457,6 +1584,8 @@ def _smoke_test_main() -> None:
         sca_max_iters=30,
         sca_tol=1e-4,
         relaxation=1.0,
+        subproblem_method="SLSQP",
+        subproblem_maxiter=200,
         lp_method="highs",
     )
 
