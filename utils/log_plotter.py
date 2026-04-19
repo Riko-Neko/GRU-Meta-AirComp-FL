@@ -93,6 +93,8 @@ def _model_from_aircomp_line(msg: str) -> Optional[str]:
         return "CNN-arch"
     if msg.startswith("CNN-base AirComp"):
         return "CNN-base"
+    if msg.startswith("LMMSE AirComp"):
+        return "LMMSE"
     if msg.startswith("AirComp eta="):
         return "GRU"
     return None
@@ -182,6 +184,19 @@ def _pair_prefix_and_optimizer_from_path(log_path: str, default_optimizer: Optio
     return legacy_prefix, default_optimizer
 
 
+def _read_experiment_prefix_from_log(log_path: str) -> Optional[str]:
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                msg = _strip_ansi(raw.rstrip("\n"))
+                msg = msg.split("] ", 1)[1] if "] " in msg else msg
+                if msg.startswith("Experiment prefix="):
+                    return msg.split("=", 1)[1].strip()
+    except OSError:
+        return None
+    return None
+
+
 def _proxy_model_order(enable_cnn_arch: bool, enable_cnn_baseline: bool, enable_lmmse: bool):
     order = ["GRU"]
     if enable_cnn_arch:
@@ -205,6 +220,7 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
     round_gru_group_proxy_nmse: Dict[str, Dict[int, float]] = {}
     current_round: Optional[int] = None
     pending_proxy_model: Optional[str] = None
+    experiment_prefix: Optional[str] = None
     enable_cnn_arch = False
     enable_cnn_baseline = False
     enable_lmmse = False
@@ -222,6 +238,8 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
                 enable_cnn_baseline = True
             if "LMMSE baseline enabled=True" in msg:
                 enable_lmmse = True
+            if msg.startswith("Experiment prefix="):
+                experiment_prefix = msg.split("=", 1)[1].strip()
             m_opt = BEAM_RIS_OPT_RE.search(msg)
             if m_opt:
                 beam_ris_optimizer = m_opt.group(1).strip().lower()
@@ -327,7 +345,8 @@ def _parse_log_metrics(log_path: str) -> Dict[str, Dict[str, Dict[int, float]]]:
                     _append_metric(round_uplink_true_nmse, model_uplink, current_round, float(m_uplink.group(1)))
                 continue
 
-    log_pair_prefix, inferred_optimizer = _pair_prefix_and_optimizer_from_path(log_path, beam_ris_optimizer)
+    path_pair_prefix, inferred_optimizer = _pair_prefix_and_optimizer_from_path(log_path, beam_ris_optimizer)
+    log_pair_prefix = experiment_prefix or path_pair_prefix
     if beam_ris_optimizer is None:
         beam_ris_optimizer = inferred_optimizer
     return {
@@ -558,7 +577,9 @@ def _find_optimizer_pair_log(log_path: str, current_meta: Dict[str, Optional[str
             if os.path.abspath(candidate_path) == os.path.abspath(log_path):
                 continue
             candidate_optimizer = _read_optimizer_mode_from_log(candidate_path)
-            candidate_prefix, _ = _pair_prefix_and_optimizer_from_path(candidate_path, candidate_optimizer)
+            candidate_prefix = _read_experiment_prefix_from_log(candidate_path)
+            if candidate_prefix is None:
+                candidate_prefix, _ = _pair_prefix_and_optimizer_from_path(candidate_path, candidate_optimizer)
             if candidate_optimizer != target_optimizer:
                 continue
             if candidate_prefix != pair_prefix:

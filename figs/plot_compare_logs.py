@@ -20,7 +20,7 @@ import math
 from pathlib import Path
 import re
 import sys
-from typing import List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +41,12 @@ from utils.log_plotter import (  # noqa: E402
 
 
 MAX_LOGS = 4
-LINESTYLES = ("-", "--", "-.", ":")
+LINESTYLES = (
+    "-",
+    "--",
+    (0, (8, 5, 2, 5)),
+    (0, (2, 5)),
+)
 GRU_GROUP_UPLINK_TITLE = "GRU Group Uplink True NMSE"
 GRU_GROUP_UPLINK_STEM = "07_gru_group_uplink_true_nmse"
 # Low/high keep the original green/orange semantics. The first log uses the
@@ -55,7 +60,7 @@ class RunMetrics:
     path: Path
     label: str
     metrics: Mapping[str, Mapping[str, Mapping[int, float]]]
-    linestyle: str
+    linestyle: Any
 
 
 def _resolve_path(path: Path) -> Path:
@@ -103,7 +108,7 @@ def _default_output_dir(labels: Sequence[str], explicit_logs: bool) -> Path:
     return PROJECT_ROOT / "figs" / name
 
 
-def _load_run_metrics(path: Path, label: str, linestyle: str) -> RunMetrics:
+def _load_run_metrics(path: Path, label: str, linestyle: Any) -> RunMetrics:
     metrics = _parse_log_metrics(str(path))
     paired_log_path = _find_optimizer_pair_log(str(path), metrics.get("_meta", {}))
     paired_metrics = _parse_log_metrics(paired_log_path) if paired_log_path is not None else None
@@ -147,6 +152,9 @@ def _render_matplotlib(
     dpi: int,
 ) -> None:
     try:
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
     except Exception as exc:
@@ -156,7 +164,8 @@ def _render_matplotlib(
     for title, file_stem, model_order, model_colors, model_styles in specs:
         ylog = title not in LINEAR_Y_TITLES
         is_gru_group_uplink = _is_gru_group_uplink(title, file_stem)
-        fig, ax = plt.subplots(figsize=(7.6, 5.2), constrained_layout=True)
+        fig, ax = plt.subplots(figsize=(7.2, 6.4))
+        fig.subplots_adjust(left=0.09, right=0.98, top=0.91, bottom=0.19)
         any_curve = False
         used_models = set()
         for run_idx, run in enumerate(runs):
@@ -188,9 +197,7 @@ def _render_matplotlib(
                     values,
                     color=color,
                     linestyle=linestyle,
-                    linewidth=style.get("linewidth", 1.6),
-                    marker="o",
-                    markersize=2,
+                    linewidth=style.get("linewidth", 1.8),
                     alpha=0.95,
                 )
                 used_models.add(model)
@@ -202,7 +209,7 @@ def _render_matplotlib(
         ax.set_ylabel("Oracle gap (dB)" if title == PROXY_ORACLE_GAP_TITLE else "Value")
         if ylog:
             ax.set_yscale("log")
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, which="both", alpha=0.32)
 
         if any_curve:
             if is_gru_group_uplink:
@@ -232,7 +239,15 @@ def _render_matplotlib(
                     Line2D([0], [0], color="#222222", linewidth=1.8, linestyle="--", label="oracle"),
                     Line2D([0], [0], color="#222222", linewidth=1.8, linestyle="-", label="actual"),
                 ]
-                ax.legend(handles=style_handles + color_handles, fontsize=7, loc="best", ncol=2, framealpha=0.92)
+                color_legend = ax.legend(
+                    handles=color_handles,
+                    loc="center right",
+                    fontsize=8,
+                    ncol=2,
+                    framealpha=0.92,
+                )
+                ax.add_artist(color_legend)
+                ax.legend(handles=style_handles, loc="lower left", fontsize=8, framealpha=0.92)
             else:
                 model_handles = [
                     Line2D(
@@ -250,13 +265,26 @@ def _render_matplotlib(
                     Line2D([0], [0], color="#222222", linewidth=1.8, linestyle=run.linestyle, label=run.label)
                     for run in runs
                 ]
-                first_legend = ax.legend(handles=model_handles, title="Model", fontsize=8, title_fontsize=8, loc="best")
-                ax.add_artist(first_legend)
-                ax.legend(handles=log_handles, title="Log", fontsize=8, title_fontsize=8, loc="upper right")
+                model_legend = ax.legend(
+                    handles=model_handles,
+                    fontsize=8,
+                    loc="upper right",
+                    framealpha=0.92,
+                )
+                ax.add_artist(model_legend)
+                ax.legend(handles=log_handles, fontsize=8, loc="lower left", framealpha=0.92)
         else:
             ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
 
-        fig.suptitle(" vs ".join(run.label for run in runs), fontsize=9)
+        fig.text(
+            0.01,
+            0.015,
+            f"logs: {' vs '.join(run.label for run in runs)}",
+            fontsize=7,
+            color="#555555",
+            ha="left",
+            va="bottom",
+        )
         fig.savefig(out_dir / f"{file_stem}.png", dpi=dpi)
         plt.close(fig)
 

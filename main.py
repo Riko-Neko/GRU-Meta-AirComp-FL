@@ -2768,6 +2768,7 @@ def main():
         h_eff = None
         h_eff_arch = None
         h_eff_baseline = None
+        h_eff_lmmse = None
         gru_group_user_indices = None
         gru_group_delta_vars = None
         gru_group_user_weights = None
@@ -2776,6 +2777,7 @@ def main():
         h_RUs_ota_gru = h_RUs_est if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
         h_RUs_ota_arch = h_RUs_est_arch if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
         h_RUs_ota_baseline = h_RUs_est_baseline if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
+        h_RUs_ota_lmmse = h_RUs_est_lmmse if ota_use_estimated_h_ru_for_aggregation else h_RUs_ota
         if config.use_aircomp and aircomp_sim is not None:
             if gru_group_mode == "single":
                 casc_pref = f_beam.conj() @ H_BR.T
@@ -2814,6 +2816,19 @@ def main():
                         reflect_baseline = np.dot(theta_ota_baseline, casc_pref_baseline * h_RUs_ota_baseline[k])
                     h_eff_list_baseline.append(direct_baseline + reflect_baseline)
                 h_eff_baseline = torch.from_numpy(np.asarray(h_eff_list_baseline, dtype=np.complex64))
+
+            if enable_lmmse_baseline and h_RUs_ota_lmmse is not None:
+                casc_pref_lmmse = f_beam_lmmse.conj() @ H_BR.T
+                h_eff_list_lmmse = []
+                for k in range(config.num_users):
+                    direct_lmmse = (
+                        f_beam_lmmse.conj().dot(h_BUs_ota[k]) if (direct_on == 1 and h_BUs_ota is not None) else 0.0
+                    )
+                    reflect_lmmse = 0.0
+                    if reflect_on == 1:
+                        reflect_lmmse = np.dot(theta_ota_lmmse, casc_pref_lmmse * h_RUs_ota_lmmse[k])
+                    h_eff_list_lmmse.append(direct_lmmse + reflect_lmmse)
+                h_eff_lmmse = torch.from_numpy(np.asarray(h_eff_list_lmmse, dtype=np.complex64))
         if config.use_aircomp and aircomp_sim is not None:
             if gru_group_mode == "single":
                 agg_update, diag = aircomp_sim.aggregate_updates(
@@ -3069,6 +3084,31 @@ def main():
             logger.info(
                 "CNN-base global update norm: "
                 f"{torch.norm(new_global_vec_baseline - old_global_vec_baseline).item():.4e}"
+            )
+
+        if (enable_lmmse_baseline and config.use_aircomp and aircomp_sim is not None
+                and gru_group_mode == "single" and h_eff_lmmse is not None):
+            # Diagnostic only: LMMSE has no trainable FL model update, so reuse the
+            # current GRU update vectors to isolate AirComp quality under LMMSE CSI.
+            with torch.random.fork_rng(devices=[]):
+                agg_update_lmmse_diag, diag_lmmse = aircomp_sim.aggregate_updates(
+                    updates=delta_mat.float(),
+                    h_eff=h_eff_lmmse,
+                    user_weights=K_norm,
+                )
+            ideal_update_lmmse = (delta_mat * K_norm.view(-1, 1)).sum(dim=0) / (K_norm.sum() + 1e-12)
+            agg_error_power_lmmse = torch.norm(agg_update_lmmse_diag - ideal_update_lmmse) ** 2
+            ideal_power_lmmse = torch.norm(ideal_update_lmmse) ** 2
+            nmse_lmmse_aircomp = agg_error_power_lmmse / (ideal_power_lmmse + 1e-12)
+            logger.info(
+                _colorize_branch_line(
+                    "LMMSE",
+                    f"LMMSE AirComp diagnostic eta={diag_lmmse['eta']:.4e}, "
+                    f"min|u|^2={diag_lmmse['min_inner2']:.4e}, "
+                    f"agg_NMSE={_highlight_metric_value(nmse_lmmse_aircomp.item(), 'LMMSE')}, "
+                    f"agg_err={agg_error_power_lmmse.item():.4e}, "
+                    f"ideal_power={ideal_power_lmmse.item():.4e}",
+                )
             )
 
         if eta_snapshot_enabled and (round_idx % eta_snapshot_every == 0):
